@@ -131,31 +131,29 @@ def visualize_pointcloud(points: np.ndarray, planes: List[np.ndarray] = None):
     vis.run()
     vis.destroy_window()
 
-def find_max_points_branches(tree_data: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """找到主干和两个最大分支的点
-    
-    Args:
-        tree_data: 树形数据
-    
-    Returns:
-        主干点云，第一个分支点云，第二个分支点云
-    """
-    # 获取主干点
-    trunk_points = np.array(tree_data["branches"][0]["points"])
-    
-    # 获取所有一级分支
-    first_level_branches = tree_data["branches"][0]["children"]
-    
-    # 按点数排序分支
-    sorted_branches = sorted(first_level_branches, 
-                           key=lambda x: len(x["points"]), 
-                           reverse=True)
-    
-    # 获取点数最多的两个分支
-    branch1_points = np.array(sorted_branches[0]["points"])
-    branch2_points = np.array(sorted_branches[1]["points"])
-    
-    return trunk_points, branch1_points, branch2_points
+# ----------  find_max_points_branches utility (ensure defined) ----------
+try:
+    find_max_points_branches  # type: ignore
+except NameError:
+    def find_max_points_branches(tree_data: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """遍历 tree_data 取得主干与点数最多的两条一级分支点云
+        返回 (trunk_pts, branch1_pts, branch2_pts)
+        若一级分支不足 2 条则返回空数组占位"""
+        trunk_points = np.array(tree_data["branches"][0]["points"], dtype=np.float32)
+        branches = tree_data["branches"][0].get("children", [])
+        if len(branches) < 2:
+            # fallback: 直接按 children 全部或自己复制
+            if len(branches) == 1:
+                branch1_pts = np.array(branches[0]["points"], dtype=np.float32)
+                branch2_pts = branch1_pts.copy()
+            else:
+                branch1_pts = branch2_pts = trunk_points.copy()
+            return trunk_points, branch1_pts, branch2_pts
+        # sort by number of points
+        branches_sorted = sorted(branches, key=lambda b: len(b["points"]), reverse=True)
+        branch1_pts = np.array(branches_sorted[0]["points"], dtype=np.float32)
+        branch2_pts = np.array(branches_sorted[1]["points"], dtype=np.float32)
+        return trunk_points, branch1_pts, branch2_pts
 
 def calculate_plane_equation(points: np.ndarray, normal_constraint: np.ndarray = None) -> Tuple[np.ndarray, float]:
     """计算平面的法向量和常数项
@@ -223,94 +221,197 @@ def calculate_perpendicular_plane(points: np.ndarray, normal_constraint: np.ndar
     d = -np.dot(perpendicular, centroid)
     return perpendicular, d
 
-def plot_points_and_planes(trunk_points: np.ndarray, 
-                          branch1_points: np.ndarray, 
+def plot_points_and_planes(trunk_points: np.ndarray,
+                          branch1_points: np.ndarray,
                           branch2_points: np.ndarray):
-    """绘制点和两个垂直平面
+    """绘制主干与两条分支点云、对应的两个互相垂直平面以及法向量
     
-    Args:
-        trunk_points: 主干点云
-        branch1_points: 第一个分支点云
-        branch2_points: 第二个分支点云
+    trunk_points   : 主干点云 (N,3)
+    branch1_points : 第一分支点云 (M,3)
+    branch2_points : 第二分支点云 (K,3)
     """
+    # 准备 Matplotlib 3D 轴
     fig = plt.figure(figsize=(12, 12))
     ax = fig.add_subplot(111, projection='3d')
-    
-    # 绘制点
-    trunk_scatter = ax.scatter(trunk_points[:, 0], trunk_points[:, 1], trunk_points[:, 2], 
-                             c='blue', label='Trunk', s=30)
-    branch1_scatter = ax.scatter(branch1_points[:, 0], branch1_points[:, 1], branch1_points[:, 2], 
-                               c='green', label='Branch 1', s=30)
-    branch2_scatter = ax.scatter(branch2_points[:, 0], branch2_points[:, 1], branch2_points[:, 2], 
-                               c='red', label='Branch 2', s=30)
-    
-    # 计算第一个平面（使用两个分支的点）
+
+    # 绘制散点
+    ax.scatter(*trunk_points.T,  c='blue',  s=30, label='Trunk')
+    ax.scatter(*branch1_points.T, c='green', s=30, label='Branch 1')
+    ax.scatter(*branch2_points.T, c='red',   s=30, label='Branch 2')
+
+    # ---------- 1. 计算两个平面 ---------- #
     branch_points = np.vstack([branch1_points, branch2_points])
-    normal1, d1 = calculate_plane_equation(branch_points)
-    
-    # 计算第二个平面（使用主干的点，且垂直于第一个平面）
-    normal2, d2 = calculate_perpendicular_plane(trunk_points, normal1)
-    
-    # 创建平面网格
-    x = np.linspace(min(branch_points[:, 0]), max(branch_points[:, 0]), 20)
-    y = np.linspace(min(branch_points[:, 1]), max(branch_points[:, 1]), 20)
-    X, Y = np.meshgrid(x, y)
-    
-    # 绘制第一个平面
-    Z1 = (-normal1[0] * X - normal1[1] * Y - d1) / normal1[2]
-    branch_plane = ax.plot_surface(X, Y, Z1, alpha=0.2, color='green')
-    
-    # 绘制第二个平面
-    Z2 = (-normal2[0] * X - normal2[1] * Y - d2) / normal2[2]
-    trunk_plane = ax.plot_surface(X, Y, Z2, alpha=0.2, color='blue')
-    
-    # 绘制法向量
-    center1 = np.mean(branch_points, axis=0)
-    center2 = np.mean(trunk_points, axis=0)
-    
-    # 绘制第一个平面的法向量
-    branch_normal = ax.quiver(center1[0], center1[1], center1[2],
-                            normal1[0], normal1[1], normal1[2],
-                            length=5, color='green', arrow_length_ratio=0.3)
-    
-    # 绘制第二个平面的法向量
-    trunk_normal = ax.quiver(center2[0], center2[1], center2[2],
-                           normal2[0], normal2[1], normal2[2],
-                           length=5, color='blue', arrow_length_ratio=0.3)
-    
-    # 设置图形属性
+    normal1, _ = calculate_plane_equation(branch_points)            # 分支平面法向量
+    normal1 /= np.linalg.norm(normal1)
+
+    normal2, _ = calculate_perpendicular_plane(trunk_points, normal1) # 主干平面法向量 (垂直 normal1)
+    normal2 /= np.linalg.norm(normal2)
+
+    # ---------- 2. 生成平面网格 ---------- #
+    def plane_mesh(center: np.ndarray, normal: np.ndarray,
+                   plane_size: float = 30.0, density: int = 20):
+        """基于中心点与法向量生成矩形网格 (X,Y,Z)"""
+        # 找到在该平面内的两个正交方向 v1,v2
+        helper = np.array([1.0, 0.0, 0.0])
+        if np.allclose(np.abs(np.dot(helper, normal)), 1.0, atol=1e-3):
+            helper = np.array([0.0, 1.0, 0.0])
+        v1 = np.cross(normal, helper)
+        v1 /= np.linalg.norm(v1)
+        v2 = np.cross(normal, v1)
+        v2 /= np.linalg.norm(v2)
+
+        grid = np.linspace(-plane_size/2, plane_size/2, density)
+        u, v = np.meshgrid(grid, grid)
+        pts = center + u[..., None]*v1 + v[..., None]*v2
+        return pts[...,0], pts[...,1], pts[...,2]
+
+    center1 = branch_points.mean(axis=0)
+    center2 = trunk_points.mean(axis=0)
+
+    X1, Y1, Z1 = plane_mesh(center1, normal1)
+    X2, Y2, Z2 = plane_mesh(center2, normal2)
+
+    ax.plot_surface(X1, Y1, Z1, alpha=0.25, color='lightgreen')
+    ax.plot_surface(X2, Y2, Z2, alpha=0.25, color='lightblue')
+
+    # ---------- 3. 绘制法向量 ---------- #
+    ax.quiver(*center1, *normal1, length=5, color='green', linewidth=2, arrow_length_ratio=0.3)
+    ax.quiver(*center2, *normal2, length=5, color='blue',  linewidth=2, arrow_length_ratio=0.3)
+
+    # ---------- 4. 轴与图例设置 ---------- #
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
-    
-    # 创建图例
-    from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0], [0], marker='o', color='w', label='Trunk',
-               markerfacecolor='blue', markersize=10),
-        Line2D([0], [0], marker='o', color='w', label='Branch 1',
-               markerfacecolor='green', markersize=10),
-        Line2D([0], [0], marker='o', color='w', label='Branch 2',
-               markerfacecolor='red', markersize=10),
-        Line2D([0], [0], color='green', label='Branch Plane',
-               alpha=0.2, linewidth=10),
-        Line2D([0], [0], color='blue', label='Trunk Plane',
-               alpha=0.2, linewidth=10)
-    ]
-    ax.legend(handles=legend_elements)
-    
-    # 设置视角
-    ax.view_init(elev=20, azim=45)
-    
-    # 打印平面方程和法向量点积（应该接近0）
-    print("第一个平面方程（分支平面）:")
-    print(f"{normal1[0]:.2f}x + {normal1[1]:.2f}y + {normal1[2]:.2f}z + {d1:.2f} = 0")
-    print("\n第二个平面方程（主干平面）:")
-    print(f"{normal2[0]:.2f}x + {normal2[1]:.2f}y + {normal2[2]:.2f}z + {d2:.2f} = 0")
-    print("\n两个法向量的点积（应该接近0）:")
-    print(f"{np.dot(normal1, normal2):.6f}")
-    
+    ax.legend(loc='upper left')
+    ax.view_init(elev=25, azim=40)
     plt.show()
+
+def visualize_plane_normals(planes, normals, vis):
+    """
+    绘制平面的法向量
+    
+    参数:
+    planes: 平面点云列表
+    normals: 法向量列表
+    vis: Open3D可视化器
+    """
+    for i, (plane_points, normal) in enumerate(zip(planes, normals)):
+        # 计算平面的中心点
+        center = np.mean(plane_points, axis=0)
+        
+        # 创建法向量的起点和终点
+        start_point = center
+        end_point = center + normal * 50  # 法向量长度设为50
+        
+        # 创建箭头
+        points = np.array([start_point, end_point])
+        lines = np.array([[0, 1]])  # 连接起点和终点
+        
+        # 创建LineSet
+        line_set = o3d.geometry.LineSet()
+        line_set.points = o3d.utility.Vector3dVector(points)
+        line_set.lines = o3d.utility.Vector2iVector(lines)
+        
+        # 设置线条颜色
+        colors = np.array([[1, 0, 0] for _ in range(len(lines))])  # 红色
+        line_set.colors = o3d.utility.Vector3dVector(colors)
+        
+        # 添加到可视化器
+        vis.add_geometry(line_set)
+        
+        # 添加箭头头部
+        arrow_head = o3d.geometry.TriangleMesh.create_cone(radius=5, height=10)
+        # 计算箭头头部的旋转
+        z_axis = np.array([0, 0, 1])
+        rotation_axis = np.cross(z_axis, normal)
+        rotation_angle = np.arccos(np.dot(z_axis, normal) / (np.linalg.norm(z_axis) * np.linalg.norm(normal)))
+        if np.linalg.norm(rotation_axis) > 0:
+            rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+            R = o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * rotation_angle)
+            arrow_head.rotate(R, center=[0, 0, 0])
+        
+        # 移动箭头头部到终点
+        arrow_head.translate(end_point)
+        arrow_head.paint_uniform_color([1, 0, 0])  # 红色
+        
+        # 添加到可视化器
+        vis.add_geometry(arrow_head)
+
+def compute_tree_plane_normals(tree_data: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+    """根据树形数据计算分支平面与主干平面的法向量
+    
+    Args:
+        tree_data: 树形 JSON 数据 (包含 branches 列表)
+    Returns:
+        (normal_branch, normal_trunk) : 两个单位法向量
+    """
+    trunk_pts, br1_pts, br2_pts = find_max_points_branches(tree_data)
+    branch_pts = np.vstack([br1_pts, br2_pts])
+    # 分支平面法向量
+    normal_branch, _ = calculate_plane_equation(branch_pts)
+    normal_branch = normal_branch / np.linalg.norm(normal_branch)
+    # 主干平面法向量 (要求与 branch 平面垂直)
+    normal_trunk, _ = calculate_perpendicular_plane(trunk_pts, normal_branch)
+    normal_trunk = normal_trunk / np.linalg.norm(normal_trunk)
+    return normal_branch, normal_trunk
+
+def generate_noisy_normals(base_normal: np.ndarray, n: int, max_angle_deg: float = 20.0, seed: int = None) -> np.ndarray:
+    """围绕基准法向量生成带有角度扰动的法向量
+    
+    Args:
+        base_normal : 基准单位法向量 (3,)
+        n           : 生成数量
+        max_angle_deg : 在每个欧拉角方向的最大偏转角度(度)
+        seed        : 随机种子 (可选)
+    Returns:
+        noisy_normals : (n,3) 的单位向量数组
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    base_normal = base_normal / np.linalg.norm(base_normal)
+    noisy_list = []
+    for _ in range(n):
+        # 在 (-max_angle, max_angle) 范围随机采样三个欧拉角
+        angles = np.deg2rad(np.random.uniform(-max_angle_deg, max_angle_deg, size=3))
+        rx, ry, rz = angles
+        # 分别构建绕 x/y/z 轴的小角度旋转矩阵
+        R_x = np.array([[1, 0, 0],
+                        [0, np.cos(rx), -np.sin(rx)],
+                        [0, np.sin(rx),  np.cos(rx)]])
+        R_y = np.array([[ np.cos(ry), 0, np.sin(ry)],
+                        [0, 1, 0],
+                        [-np.sin(ry), 0, np.cos(ry)]])
+        R_z = np.array([[np.cos(rz), -np.sin(rz), 0],
+                        [np.sin(rz),  np.cos(rz), 0],
+                        [0, 0, 1]])
+        # 组合旋转 (Z * Y * X)
+        R = R_z @ R_y @ R_x
+        new_normal = R @ base_normal
+        new_normal /= np.linalg.norm(new_normal)
+        noisy_list.append(new_normal)
+    return np.array(noisy_list)
+
+def calculate_normal_vector(points):
+    # 计算点云的中心点
+    centroid = np.mean(points, axis=0)
+    
+    # 计算协方差矩阵
+    centered_points = points - centroid
+    cov_matrix = np.cov(centered_points.T)
+    
+    # 计算协方差矩阵的特征值和特征向量
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+    
+    # 最小特征值对应的特征向量即为法向量
+    normal = eigenvectors[:, 0]
+    
+    # 确保法向量指向外部
+    vectors_to_center = points - centroid
+    dot_products = np.dot(vectors_to_center, normal)
+    if np.sum(dot_products < 0) > len(points) / 2:
+        normal = -normal
+    
+    return normal / np.linalg.norm(normal)
 
 if __name__ == "__main__":
     # 加载树形点云数据
@@ -332,4 +433,18 @@ if __name__ == "__main__":
     trunk_points, branch1_points, branch2_points = find_max_points_branches(tree_data)
     
     # 绘制点和平面
-    plot_points_and_planes(trunk_points, branch1_points, branch2_points) 
+    plot_points_and_planes(trunk_points, branch1_points, branch2_points)
+
+    # 计算单个点云的法向量
+    # normal = calculate_normal_vector(trunk_points)
+
+    # 可视化点云及其法向量
+    # visualize_with_normals(trunk_points, normal_scale=5.0)
+
+    # # 可视化多个平面及其法向量
+    # planes = [trunk_points, trunk_points]
+    # normals = [normal, normal]
+    # vis = o3d.visualization.Visualizer()
+    # vis.create_window()
+    # visualize_plane_normals(planes, normals, vis)
+    # vis.run() 
