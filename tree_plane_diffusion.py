@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import pdb
-from visual import compute_tree_plane_normals
+from visual import compute_tree_plane_normals, calculate_perpendicular_plane, find_max_points_branches, generate_noisy_normals
 from tree_plane_predictor import tree_points_to_array, PointEncoder
 
 # --------- Noise schedule utilities ---------
@@ -38,6 +38,9 @@ class TreeNormalDiffusionDataset(Dataset):
         xyz = xyz/(xyz.std()+1e-6)
         ids = pts[:,3:5]/100.0
         feat = np.concatenate([xyz, ids], axis=1)
+        # 修改目标数据以包含法向量和连接点坐标
+        # pdb.set_trace()
+        target = np.concatenate([target, pts[0, :3]], axis=0)  # 假设连接点坐标在 pts 的前 3 列
         return torch.tensor(feat, dtype=torch.float32), torch.tensor(target, dtype=torch.float32)
 
 # --------- Conditioned Noise Predictor ---------
@@ -48,12 +51,12 @@ class CondNoisePredictor(nn.Module):
         self.time_fc = nn.Linear(1, emb_dim)
         self.cond_fc = nn.Linear(3, emb_dim)  # 将 PointEncoder 输出映射到 emb_dim
         self.mlp = nn.Sequential(
-            nn.Linear(emb_dim+3, 128),
+            nn.Linear(emb_dim+6, 128),
             nn.SiLU(),
-            nn.Linear(128, 3)
+            nn.Linear(128, 6)  # 修改输出维度为 6
         )
     def forward(self, pts:torch.Tensor, noisy_n:torch.Tensor, t:torch.Tensor):
-        # pts: (B,N,F)  noisy_n:(B,3) t:(B,)
+        # pts: (B,N,F)  noisy_n:(B,6) t:(B,)
         cond_raw = self.encoder(pts)           # (B,3)
         cond_emb = self.cond_fc(cond_raw)      # (B,emb_dim)
         time_emb = torch.sin(self.time_fc(t.float().unsqueeze(1)))  # (B,emb_dim)
@@ -98,7 +101,7 @@ def denoise_with_tree(tree_json:str, model:CondNoisePredictor, betas:torch.Tenso
     ids = pts_arr[:,3:5]/100.0
     feats = torch.tensor(np.concatenate([xyz,ids],axis=1)[None,...],dtype=torch.float32,device=device)
     T = betas.shape[0]
-    x = F.normalize(torch.randn(1,3,device=device), dim=1)
+    x = F.normalize(torch.randn(1,6,device=device), dim=1)  # 修改为 6 维
     with torch.no_grad():
         for t_inv in range(T-1,-1,-1):
             t=torch.tensor([t_inv],device=device)
@@ -108,10 +111,88 @@ def denoise_with_tree(tree_json:str, model:CondNoisePredictor, betas:torch.Tenso
             x = F.normalize(x,dim=1)
     return x.squeeze().cpu().numpy()
 
+# --------- Denoise with GIF ---------
+
+def denoise_with_gif(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor, gif_path:str='denoise.gif', device='cpu', max_angle_deg:int=80):
+    """与 denoise_with_tree 相同，但每一步将法向量渲染为箭头并保存 GIF"""
+    import imageio, matplotlib.pyplot as plt
+    with open(tree_json,'r') as fp:
+        td=json.load(fp)
+    pts_arr = tree_points_to_array(td)
+    xyz = pts_arr[:,:3]
+    center = xyz.mean(axis=0)
+    # normalize feats same as before
+    xyz_n = xyz-center
+    xyz_n = xyz_n/(xyz_n.std()+1e-6)
+    ids = pts_arr[:,3:5]/100.0
+    feats = torch.tensor(np.concatenate([xyz_n,ids],axis=1)[None,...],dtype=torch.float32,device=device)
+    T = betas.shape[0]
+    # 选取与目标平面有较大偏差的初始法向量
+    branch_gt,_ = compute_tree_plane_normals(td)
+    noisy_init = generate_noisy_normals(branch_gt,1,max_angle_deg=max_angle_deg,seed=None)[0]
+    x = torch.tensor(noisy_init, dtype=torch.float32, device=device).unsqueeze(0)
+    x = F.normalize(x, dim=1)
+    frames=[]
+    # precompute point sets for scatter
+    trunk_pts, br1_pts, br2_pts = find_max_points_branches(td)
+    branch_pts = np.vstack([br1_pts, br2_pts])
+
+    def plane_mesh(center, normal, plane_size=30.0, density=15):
+        helper = np.array([1.,0.,0.])
+        if np.allclose(abs(np.dot(helper, normal)),1.0,atol=1e-3):
+            helper=np.array([0.,1.,0.])
+        v1=np.cross(normal,helper); v1/=np.linalg.norm(v1)
+        v2=np.cross(normal,v1); v2/=np.linalg.norm(v2)
+        g=np.linspace(-plane_size/2,plane_size/2,density)
+        u,v=np.meshgrid(g,g)
+        pts=center+u[...,None]*v1+v[...,None]*v2
+        return pts[...,0],pts[...,1],pts[...,2]
+
+    with torch.no_grad():
+        for t_inv in range(T-1,-1,-1):
+            # render current state
+            n_vec = x.squeeze().cpu().numpy(); n_vec/=np.linalg.norm(n_vec)
+            n_perp, _ = calculate_perpendicular_plane(trunk_pts, n_vec); n_perp/=np.linalg.norm(n_perp)
+
+            fig = plt.figure(figsize=(6,6))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.scatter(*trunk_pts.T,  c='blue',  s=5)
+            ax.scatter(*br1_pts.T,    c='green', s=5)
+            ax.scatter(*br2_pts.T,    c='red',   s=5)
+
+            cen_branch = branch_pts.mean(axis=0)
+            cen_trunk  = trunk_pts.mean(axis=0)
+            X1,Y1,Z1 = plane_mesh(cen_branch, n_vec)
+            X2,Y2,Z2 = plane_mesh(cen_trunk,  n_perp)
+            ax.plot_surface(X1,Y1,Z1,alpha=0.2,color='lightgreen')
+            ax.plot_surface(X2,Y2,Z2,alpha=0.2,color='lightblue')
+            ax.quiver(*cen_branch, *n_vec, length=5,color='green')
+            ax.quiver(*cen_trunk,  *n_perp,length=5,color='blue')
+
+            ax.set_xlim(cen_branch[0]-30, cen_branch[0]+30)
+            ax.set_ylim(cen_branch[1]-30, cen_branch[1]+30)
+            ax.set_zlim(cen_branch[2]-30, cen_branch[2]+30)
+            ax.set_axis_off()
+            fig.canvas.draw()
+            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
+            frame = frame.reshape(fig.canvas.get_width_height()[::-1]+(3,))
+            frames.append(frame)
+            plt.close(fig)
+
+            # diffusion step
+            t=torch.tensor([t_inv],device=device)
+            beta=betas[t_inv]
+            pred_noise = model(feats, x, t)
+            x = (x - torch.sqrt(beta)*pred_noise)/torch.sqrt(1-beta)
+            x = F.normalize(x,dim=1)
+    imageio.mimsave(gif_path, frames, fps=10)
+    return x.squeeze().cpu().numpy()
+
 if __name__=='__main__':
     import glob
     files = glob.glob('tree_*.json')
     if len(files):
-        model, betas = train_tree_diffusion(files, epochs=500, device='cpu')
+        model, betas = train_tree_diffusion(files, epochs=10000, device='cpu')
         pred = denoise_with_tree(files[0], model, betas)
+        pred = denoise_with_gif(files[0], model, betas, gif_path='denoise.gif')
         print('Pred normal diff:', pred) 
