@@ -78,9 +78,15 @@ def train_tree_diffusion(train_files: List[str], T:int=100, epochs:int=10000, ba
             B = clean.shape[0]
             t = torch.randint(0, T, (B,), device=device)
             beta_t = betas[t].unsqueeze(1)
+            # 在循环之前生成随机噪声
             noise = torch.randn_like(clean)
-            noisy = torch.sqrt(1-beta_t)*clean + torch.sqrt(beta_t)*noise
-            noisy = F.normalize(noisy, dim=1)
+            # 计算每一步的噪声增量
+            noise_step = noise / T
+            noisy = clean.clone()
+            for step in range(T):
+                # 按比例加入噪声
+                noisy = torch.sqrt(1-beta_t)*noisy + torch.sqrt(beta_t)*noise_step
+                noisy = F.normalize(noisy, dim=1)
             pred_noise = model(feats, noisy, t)
             loss = F.mse_loss(pred_noise, noise)
             opt.zero_grad(); loss.backward(); opt.step()
@@ -101,7 +107,11 @@ def denoise_with_tree(tree_json:str, model:CondNoisePredictor, betas:torch.Tenso
     ids = pts_arr[:,3:5]/100.0
     feats = torch.tensor(np.concatenate([xyz,ids],axis=1)[None,...],dtype=torch.float32,device=device)
     T = betas.shape[0]
-    x = F.normalize(torch.randn(1,6,device=device), dim=1)  # 修改为 6 维
+    # 初始化6维向量：前3维为法向量，后3维为坐标
+    initial_normal = torch.randn(3, device=device)
+    initial_coord = torch.randn(3, device=device) 
+    x = torch.cat([initial_normal, initial_coord]).unsqueeze(0)  # (1, 6)
+    x = F.normalize(x, dim=1)
     with torch.no_grad():
         for t_inv in range(T-1,-1,-1):
             t=torch.tensor([t_inv],device=device)
@@ -127,10 +137,13 @@ def denoise_with_gif(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor
     ids = pts_arr[:,3:5]/100.0
     feats = torch.tensor(np.concatenate([xyz_n,ids],axis=1)[None,...],dtype=torch.float32,device=device)
     T = betas.shape[0]
-    # 选取与目标平面有较大偏差的初始法向量
+    # 初始化6维向量：前3维为法向量，后3维为坐标
     branch_gt,_ = compute_tree_plane_normals(td)
     noisy_init = generate_noisy_normals(branch_gt,1,max_angle_deg=max_angle_deg,seed=None)[0]
-    x = torch.tensor(noisy_init, dtype=torch.float32, device=device).unsqueeze(0)
+    # 添加坐标信息，组成6维向量
+    initial_coord = center + np.random.randn(3) * 5  # 在中心附近随机初始化坐标
+    combined_init = np.concatenate([noisy_init, initial_coord])
+    x = torch.tensor(combined_init, dtype=torch.float32, device=device).unsqueeze(0)
     x = F.normalize(x, dim=1)
     frames=[]
     # precompute point sets for scatter
@@ -150,8 +163,10 @@ def denoise_with_gif(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor
 
     with torch.no_grad():
         for t_inv in range(T-1,-1,-1):
-            # render current state
-            n_vec = x.squeeze().cpu().numpy(); n_vec/=np.linalg.norm(n_vec)
+            # render current state - 提取前3维作为法向量，后3维作为坐标
+            current_vec = x.squeeze().cpu().numpy()
+            n_vec = current_vec[:3]; n_vec/=np.linalg.norm(n_vec)
+            pred_coord = current_vec[3:6]  # 预测的坐标
             n_perp, _ = calculate_perpendicular_plane(trunk_pts, n_vec); n_perp/=np.linalg.norm(n_perp)
 
             fig = plt.figure(figsize=(6,6))
@@ -162,12 +177,16 @@ def denoise_with_gif(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor
 
             cen_branch = branch_pts.mean(axis=0)
             cen_trunk  = trunk_pts.mean(axis=0)
+            # 使用预测的坐标作为法向量起点
+            arrow_start = pred_coord
             X1,Y1,Z1 = plane_mesh(cen_branch, n_vec)
             X2,Y2,Z2 = plane_mesh(cen_trunk,  n_perp)
             ax.plot_surface(X1,Y1,Z1,alpha=0.2,color='lightgreen')
             ax.plot_surface(X2,Y2,Z2,alpha=0.2,color='lightblue')
-            ax.quiver(*cen_branch, *n_vec, length=5,color='green')
+            ax.quiver(*arrow_start, *n_vec, length=5,color='green', linewidth=2)
             ax.quiver(*cen_trunk,  *n_perp,length=5,color='blue')
+            # 标记预测的分叉点坐标
+            ax.scatter(*arrow_start, color='red', s=50, marker='o')
 
             ax.set_xlim(cen_branch[0]-30, cen_branch[0]+30)
             ax.set_ylim(cen_branch[1]-30, cen_branch[1]+30)
@@ -192,7 +211,7 @@ if __name__=='__main__':
     import glob
     files = glob.glob('tree_*.json')
     if len(files):
-        model, betas = train_tree_diffusion(files, epochs=10000, device='cpu')
+        model, betas = train_tree_diffusion(files, epochs=5000, device='cpu')
         pred = denoise_with_tree(files[0], model, betas)
         pred = denoise_with_gif(files[0], model, betas, gif_path='denoise.gif')
         print('Pred normal diff:', pred) 
