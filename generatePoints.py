@@ -130,46 +130,62 @@ def generate_tree(levels: int = 3, points_per_branch: int = 10) -> Dict[str, Any
         else:
             actual_direction = direction
             
-        # 生成2-3个分支
-        num_branches = np.random.randint(2, 3)
-        angles = np.linspace(-30, 30, num_branches)
+        # 分支起点 = 主干终点
+        start_point = np.array(parent_branch["points"][-1])
         
-        # 计算垂直于实际方向的向量作为旋转轴
+        # 生成2个分支
+        num_branches = 2
+        angles = [15, 60]  # 固定两个角度
+        
+        # 计算分支平面的法向量（垂直于主干方向）
         if abs(np.dot(actual_direction, np.array([0, 0, 1]))) > 0.9:
-            perpendicular = np.array([1, 0, 0])
+            plane_normal = np.array([1, 0, 0])
         else:
-            perpendicular = np.cross(actual_direction, np.array([0, 0, 1]))
-        perpendicular = perpendicular / np.linalg.norm(perpendicular)
+            plane_normal = np.cross(actual_direction, np.array([0, 0, 1]))
+        plane_normal = plane_normal / np.linalg.norm(plane_normal)
         
-        for angle in angles:
-            # 随机旋转
-            random_rotation = np.random.uniform(-20, 20)
-            total_angle = angle + random_rotation
+        # 计算平面内的另一个基向量
+        plane_tangent = np.cross(plane_normal, actual_direction)
+        plane_tangent = plane_tangent / np.linalg.norm(plane_tangent)
+        lengthlist = [0.2,0.6]
+        for i, angle in enumerate(angles):
+            # 计算分支在平面内的方向
+            angle_rad = np.radians(angle)
+            branch_direction = actual_direction * np.cos(angle_rad) + plane_tangent * np.sin(angle_rad)
+            branch_direction = branch_direction / np.linalg.norm(branch_direction)
             
-            # 计算新分支的方向
-            # 首先绕实际方向旋转
-            rotation_matrix = calculate_rotation_matrix(perpendicular, total_angle)
-            new_direction = rotation_matrix @ actual_direction
-            print(f'new_direction {new_direction}, level {level}, rotation_matrix {rotation_matrix}, actual_direction {actual_direction}, angle {angle}, random_rotation {random_rotation}')
+            # 分支长度
+            length_factor = np.random.uniform(4, 4.9)
+            new_length = max(length * length_factor, 10.0)
             
-            # 增加分支长度
-            length_factor = np.random.uniform(1, 1.3)
-            new_length = max(length * length_factor, 15.0)
+            # 椭圆参数设置
+            # minor_axis 沿着主干方向（保证起始切线方向一致）
+            minor_axis = actual_direction * (new_length * 0.4)
             
-            # 生成分支点
-            start_point = np.array(parent_branch["points"][-1])
-            branch_points = generate_branch(
-                start_point,
-                new_direction,
-                new_length,
-                points_per_branch
-            )
+            # major_axis 在平面内，垂直于minor_axis，指向分支方向
+            major_direction = branch_direction - np.dot(branch_direction, actual_direction) * actual_direction
+            if np.linalg.norm(major_direction) < 1e-6:
+                major_direction = plane_tangent
+            major_direction = major_direction / np.linalg.norm(major_direction)
+            major_axis = major_direction * new_length*lengthlist[i]
+            
+            # 生成椭圆上的点（1/4椭圆）
+            t = np.linspace(0, np.pi/4, points_per_branch)
+            branch_points = []
+            
+            for ti in t:
+                # 椭圆参数方程：P(t) = start + major*(1-cos(t)) + minor*sin(t)
+                # 这样保证 t=0 时点在start_point，且切线方向为minor_axis方向
+                point = start_point + major_axis * (1 - np.cos(ti)) + minor_axis * np.sin(ti)
+                branch_points.append(point)
+            
+            branch_points = np.array(branch_points)
             
             # 创建分支数据
             branch_data = {
                 "type": "branch",
                 "level": level,
-                "direction": new_direction.tolist(),
+                "direction": branch_direction.tolist(),
                 "length": new_length,
                 "points": branch_points.tolist(),
                 "children": []
@@ -179,7 +195,7 @@ def generate_tree(levels: int = 3, points_per_branch: int = 10) -> Dict[str, Any
             parent_branch["children"].append(branch_data)
             
             # 递归生成下一层
-            generate_branches(branch_data, new_direction, new_length, level + 1)
+            generate_branches(branch_data, branch_direction, new_length, level + 1)
     
     # 从主干开始生成分支
     generate_branches(trunk_branch, trunk_direction, trunk_length, 1)
