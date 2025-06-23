@@ -33,9 +33,10 @@ def generate_plane_points(center, normal, plane_size=30.0, grid_size=32):
 
 # --------- Dataset ---------
 class TreeNormalDiffusionDataset(Dataset):
-    def __init__(self, json_files: List[str], grid_size=32):
+    def __init__(self, json_files: List[str], grid_size=32, point_spacing=0.2):
         self.files = json_files
         self.grid_size = grid_size
+        self.point_spacing = point_spacing
         self.data = []
         self.targets = []
         for f in json_files:
@@ -47,7 +48,7 @@ class TreeNormalDiffusionDataset(Dataset):
             # 获取主干和分支点
             trunk_pts, br1_pts, br2_pts = find_max_points_branches(td)
             
-            # 计算两个分支对应点的中点
+            # 计算两个分支对应点的中点，构建中轴线
             min_len = min(len(br1_pts), len(br2_pts))
             if min_len > 0:
                 # 取相同数量的点来计算中点
@@ -58,63 +59,138 @@ class TreeNormalDiffusionDataset(Dataset):
                 # 如果没有分支点，使用主干末端作为中点
                 midpoints = np.array([trunk_pts[-1]])
             
-            # 合并主干点和中点来拟合曲面
-            surface_points = np.vstack([trunk_pts, midpoints])
+            # 构建中轴线：主干点 + 分支中点
+            centerline_points = np.vstack([trunk_pts, midpoints])
             
-            # 使用PCA找到主要方向
-            centroid = surface_points.mean(axis=0)
-            centered_points = surface_points - centroid
+            # 对中轴线点进行排序，确保连续性
+            centerline_center = centerline_points.mean(axis=0)
+            centerline_centered = centerline_points - centerline_center
             
-            # 计算协方差矩阵和主成分
-            cov_matrix = np.cov(centered_points.T)
-            eigenvals, eigenvecs = np.linalg.eigh(cov_matrix)
-            
-            # 按特征值排序（降序）
+            # 使用PCA找到中轴线的主方向
+            cov_matrix = np.cov(centerline_centered.T)
+            eigenvals, eigenvecs = np.linalg.eig(cov_matrix)
             idx = np.argsort(eigenvals)[::-1]
-            eigenvals = eigenvals[idx]
-            eigenvecs = eigenvecs[:, idx]
+            main_direction = eigenvecs[:, idx[0]]  # 中轴线主方向
             
-            # 主方向和次方向
-            primary_dir = eigenvecs[:, 0]    # 最大特征值对应的方向
-            secondary_dir = eigenvecs[:, 1]  # 第二大特征值对应的方向
+            # 将中轴线点投影到主方向上并排序
+            projections = np.dot(centerline_centered, main_direction)
+            sorted_indices = np.argsort(projections)
+            sorted_centerline = centerline_points[sorted_indices]
             
-            # 计算曲面的范围
-            proj_primary = np.dot(centered_points, primary_dir)
-            proj_secondary = np.dot(centered_points, secondary_dir)
+            # 生成曲面上的32x32网格点
+            surface_grid_points = self._generate_surface_grid(
+                sorted_centerline, main_direction, grid_size, point_spacing
+            )
             
-            primary_range = [proj_primary.min(), proj_primary.max()]
-            secondary_range = [proj_secondary.min(), proj_secondary.max()]
-            
-            # 在主平面上生成32x32网格点
-            u = np.linspace(primary_range[0], primary_range[1], grid_size)
-            v = np.linspace(secondary_range[0], secondary_range[1], grid_size)
-            U, V = np.meshgrid(u, v)
-            
-            # 将网格点转换回3D空间
-            grid_points = []
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    # 在主平面上的点
-                    point_2d = U[i,j] * primary_dir + V[i,j] * secondary_dir
-                    
-                    # 添加第三维的弯曲（基于到中心的距离）
-                    dist_from_center = np.sqrt(U[i,j]**2 + V[i,j]**2)
-                    curvature = 0.1 * dist_from_center * np.sin(dist_from_center * 0.1)  # 轻微弯曲
-                    
-                    # 第三个方向（法向量）
-                    normal_dir = eigenvecs[:, 2]
-                    point_3d = centroid + point_2d + curvature * normal_dir
-                    
-                    grid_points.append(point_3d)
-            
-            surface_grid_points = np.array(grid_points)
             self.targets.append(surface_grid_points.astype(np.float32))
+    
+    def _generate_surface_grid(self, centerline_points, main_direction, grid_size, point_spacing):
+        """
+        在以centerline_points为中轴的曲面上生成32x32网格点
+        
+        Args:
+            centerline_points: 中轴线上的点 (N, 3)
+            main_direction: 中轴线主方向
+            grid_size: 网格大小 (32)
+            point_spacing: 点间距
+        
+        Returns:
+            surface_points: 曲面上的网格点 (grid_size, grid_size, 3)
+        """
+        # 计算网格范围
+        grid_extent = (grid_size - 1) * point_spacing / 2
+        
+        # 生成沿中轴线方向的32个位置
+        centerline_start = centerline_points[0]
+        centerline_end = centerline_points[-1]
+        centerline_length = np.linalg.norm(centerline_end - centerline_start)
+        
+        # 沿中轴线生成32个等距位置
+        axis_positions = []
+        for i in range(grid_size):
+            t = i / (grid_size - 1)  # 0 到 1
+            # 在中轴线上插值
+            axis_pos = self._interpolate_on_centerline(centerline_points, t)
+            axis_positions.append(axis_pos)
+        
+        axis_positions = np.array(axis_positions)
+        
+        # 为每个轴位置构建垂直平面的坐标系
+        surface_points = np.zeros((grid_size, grid_size, 3))
+        
+        for i, axis_pos in enumerate(axis_positions):
+            # 计算在该位置处中轴线的切线方向
+            if i == 0:
+                tangent = axis_positions[1] - axis_positions[0]
+            elif i == grid_size - 1:
+                tangent = axis_positions[-1] - axis_positions[-2]
+            else:
+                tangent = axis_positions[i+1] - axis_positions[i-1]
+            
+            tangent = tangent / (np.linalg.norm(tangent) + 1e-8)
+            
+            # 构建垂直于切线的两个正交基向量
+            if abs(np.dot(tangent, np.array([1, 0, 0]))) < 0.9:
+                base_vector = np.array([1, 0, 0])
+            else:
+                base_vector = np.array([0, 1, 0])
+            
+            u_axis = np.cross(tangent, base_vector)
+            u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
+            
+            v_axis = np.cross(tangent, u_axis)
+            v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
+            
+            # 在垂直平面上生成32个点（一行）
+            for j in range(grid_size):
+                # 从 -grid_extent 到 +grid_extent 均匀分布
+                offset = (j / (grid_size - 1) - 0.5) * 2 * grid_extent
+                
+                # 在垂直平面上的点
+                point_on_surface = axis_pos + offset * u_axis
+                
+                # 添加轻微的曲率变化，使其更像真实的血管曲面
+                curvature_factor = 0.1 * abs(offset) * np.sin(i * np.pi / grid_size)
+                point_on_surface += curvature_factor * v_axis
+                
+                surface_points[i, j] = point_on_surface
+        
+        return surface_points
+    
+    def _interpolate_on_centerline(self, centerline_points, t):
+        """
+        在中轴线上按参数t插值 (t在0到1之间)
+        """
+        if len(centerline_points) == 1:
+            return centerline_points[0]
+        
+        # 计算累积弧长
+        cumulative_lengths = [0]
+        for i in range(1, len(centerline_points)):
+            dist = np.linalg.norm(centerline_points[i] - centerline_points[i-1])
+            cumulative_lengths.append(cumulative_lengths[-1] + dist)
+        
+        total_length = cumulative_lengths[-1]
+        target_length = t * total_length
+        
+        # 找到目标长度对应的线段
+        for i in range(len(cumulative_lengths) - 1):
+            if cumulative_lengths[i] <= target_length <= cumulative_lengths[i+1]:
+                # 在该线段内插值
+                segment_t = (target_length - cumulative_lengths[i]) / (cumulative_lengths[i+1] - cumulative_lengths[i])
+                return centerline_points[i] + segment_t * (centerline_points[i+1] - centerline_points[i])
+        
+        # 边界情况
+        if t <= 0:
+            return centerline_points[0]
+        else:
+            return centerline_points[-1]
             
     def __len__(self):
         return len(self.files)
     def __getitem__(self, idx):
         pts = self.data[idx]
-        target = self.targets[idx]  # (grid_size*grid_size, 3)
+        target = self.targets[idx]  # (grid_size, grid_size, 3)
         # normalize xyz
         xyz = pts[:,:3]
         xyz = xyz - xyz.mean(0, keepdims=True)
@@ -152,8 +228,8 @@ class CondNoisePredictor(nn.Module):
 
 # --------- Training function ---------
 
-def train_tree_diffusion(train_files: List[str], T:int=100, epochs:int=10000, batch_size:int=2, device='cpu', grid_size=32):
-    dataset = TreeNormalDiffusionDataset(train_files, grid_size=grid_size)
+def train_tree_diffusion(train_files: List[str], T:int=100, epochs:int=10000, batch_size:int=2, device='cpu', grid_size=32, point_spacing=0.2):
+    dataset = TreeNormalDiffusionDataset(train_files, grid_size=grid_size, point_spacing=point_spacing)
     dl = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     model = CondNoisePredictor(grid_size=grid_size).to(device)
     betas = linear_beta_schedule(T).to(device)
@@ -183,7 +259,7 @@ def train_tree_diffusion(train_files: List[str], T:int=100, epochs:int=10000, ba
 
 # --------- Denoise ---------
 
-def denoise_with_tree(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor, device='cpu', grid_size=32):
+def denoise_with_tree(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor, device='cpu', grid_size=32, point_spacing=0.2):
     with open(tree_json,'r') as fp:
         td=json.load(fp)
     pts_arr = tree_points_to_array(td)
@@ -194,8 +270,87 @@ def denoise_with_tree(tree_json:str, model:CondNoisePredictor, betas:torch.Tenso
     feats = torch.tensor(np.concatenate([xyz,ids],axis=1)[None,...],dtype=torch.float32,device=device)
     T = betas.shape[0]
     
-    # 初始化为随机分布的点云
-    x = torch.randn(1, grid_size * grid_size * 3, device=device)
+    # 获取主干点和分支点
+    trunk_pts, br1_pts, br2_pts = find_max_points_branches(td)
+    all_branch_pts = np.vstack([br1_pts, br2_pts])
+    
+    # 1. 计算所有点的中心作为平面中心
+    all_points = np.vstack([trunk_pts, br1_pts, br2_pts])
+    plane_center = all_points.mean(axis=0)
+    
+    # 2. 找到经过分支最多的平面（分支点的主平面）
+    branch_center = all_branch_pts.mean(axis=0)
+    branch_centered = all_branch_pts - branch_center
+    
+    # 计算分支点的主平面法向量
+    if len(branch_centered) >= 3:
+        branch_cov = np.cov(branch_centered.T)
+        branch_eigenvals, branch_eigenvecs = np.linalg.eigh(branch_cov)
+        branch_idx = np.argsort(branch_eigenvals)[::-1]
+        
+        # 分支主平面由前两个主成分确定，法向量是第三个主成分
+        branch_plane_normal = branch_eigenvecs[:, branch_idx[2]]  # 最小特征值对应方向
+    else:
+        # 如果分支点太少，使用默认法向量
+        branch_plane_normal = np.array([0, 0, 1])
+    
+    # 确保法向量是单位向量
+    branch_plane_normal = branch_plane_normal / np.linalg.norm(branch_plane_normal)
+    
+    # 3. 找到与分支平面垂直且经过主干最多的平面
+    trunk_center = trunk_pts.mean(axis=0)
+    trunk_centered = trunk_pts - trunk_center
+    
+    # 将主干点投影到垂直于分支平面法向量的空间中
+    projection_matrix = np.eye(3) - np.outer(branch_plane_normal, branch_plane_normal)
+    trunk_projected = trunk_centered @ projection_matrix.T
+    
+    # 在投影空间中找主干点的主方向
+    if len(trunk_projected) >= 2:
+        trunk_proj_cov = np.cov(trunk_projected.T)
+        trunk_eigenvals, trunk_eigenvecs = np.linalg.eigh(trunk_proj_cov)
+        trunk_idx = np.argsort(trunk_eigenvals)[::-1]
+        
+        # 主干在投影空间中的主方向
+        trunk_main_dir_projected = trunk_eigenvecs[:, trunk_idx[0]]
+    else:
+        trunk_main_dir_projected = np.array([1, 0, 0])
+        trunk_main_dir_projected = trunk_main_dir_projected - np.dot(trunk_main_dir_projected, branch_plane_normal) * branch_plane_normal
+    
+    # 确保主干主方向是单位向量
+    trunk_main_dir_projected = trunk_main_dir_projected / (np.linalg.norm(trunk_main_dir_projected) + 1e-8)
+    
+    # 4. 构建初始平面的坐标系
+    plane_normal = branch_plane_normal
+    u_axis = trunk_main_dir_projected
+    v_axis = np.cross(plane_normal, u_axis)
+    v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
+    u_axis = np.cross(v_axis, plane_normal)
+    u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
+    
+    # 5. 在平面上生成32x32的正方形网格，间隔为point_spacing
+    grid_extent = (grid_size - 1) * point_spacing / 2
+    u_coords = np.linspace(-grid_extent, grid_extent, grid_size)
+    v_coords = np.linspace(-grid_extent, grid_extent, grid_size)
+    U, V = np.meshgrid(u_coords, v_coords)
+    
+    # 将网格点转换到3D空间
+    grid_points = []
+    for i in range(grid_size):
+        for j in range(grid_size):
+            point_3d = plane_center + U[i,j] * u_axis + V[i,j] * v_axis
+            grid_points.append(point_3d)
+    
+    # 转换为torch tensor
+    initial_points = np.array(grid_points).flatten()
+    x = torch.tensor(initial_points, dtype=torch.float32, device=device).unsqueeze(0)
+    
+    print(f"初始平面信息:")
+    print(f"  平面中心: {plane_center}")
+    print(f"  分支平面法向量: {branch_plane_normal}")
+    print(f"  主干主方向: {trunk_main_dir_projected}")
+    print(f"  平面法向量: {plane_normal}")
+    print(f"  网格范围: {grid_extent*2:.2f} x {grid_extent*2:.2f}, 点间距: {point_spacing}")
     
     with torch.no_grad():
         for t_inv in range(T-1,-1,-1):
@@ -207,7 +362,7 @@ def denoise_with_tree(tree_json:str, model:CondNoisePredictor, betas:torch.Tenso
 
 # --------- Denoise with GIF ---------
 
-def denoise_with_gif(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor, gif_path:str='denoise.gif', device='cpu', grid_size=32):
+def denoise_with_gif(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor, gif_path:str='denoise.gif', device='cpu', grid_size=32, point_spacing=0.2):
     """可视化32*32个点在去噪过程中的移动"""
     import imageio, matplotlib.pyplot as plt
     with open(tree_json,'r') as fp:
@@ -222,12 +377,89 @@ def denoise_with_gif(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor
     feats = torch.tensor(np.concatenate([xyz_n,ids],axis=1)[None,...],dtype=torch.float32,device=device)
     T = betas.shape[0]
     
-    # 初始化为随机分布的点云
-    x = torch.randn(1, grid_size * grid_size * 3, device=device)
+    # 获取主干点和分支点
+    trunk_pts, br1_pts, br2_pts = find_max_points_branches(td)
+    all_branch_pts = np.vstack([br1_pts, br2_pts])
+    
+    # 1. 计算所有点的中心作为平面中心
+    all_points = np.vstack([trunk_pts, br1_pts, br2_pts])
+    plane_center = all_points.mean(axis=0)
+    
+    # 2. 找到经过分支最多的平面（分支点的主平面）
+    branch_center = all_branch_pts.mean(axis=0)
+    branch_centered = all_branch_pts - branch_center
+    
+    # 计算分支点的主平面法向量
+    if len(branch_centered) >= 3:
+        branch_cov = np.cov(branch_centered.T)
+        branch_eigenvals, branch_eigenvecs = np.linalg.eigh(branch_cov)
+        branch_idx = np.argsort(branch_eigenvals)[::-1]
+        
+        # 分支主平面由前两个主成分确定，法向量是第三个主成分
+        branch_plane_normal = branch_eigenvecs[:, branch_idx[2]]  # 最小特征值对应方向
+    else:
+        # 如果分支点太少，使用默认法向量
+        branch_plane_normal = np.array([0, 0, 1])
+    
+    # 确保法向量是单位向量
+    branch_plane_normal = branch_plane_normal / np.linalg.norm(branch_plane_normal)
+    
+    # 3. 找到与分支平面垂直且经过主干最多的平面
+    trunk_center = trunk_pts.mean(axis=0)
+    trunk_centered = trunk_pts - trunk_center
+    
+    # 将主干点投影到垂直于分支平面法向量的空间中
+    projection_matrix = np.eye(3) - np.outer(branch_plane_normal, branch_plane_normal)
+    trunk_projected = trunk_centered @ projection_matrix.T
+    
+    # 在投影空间中找主干点的主方向
+    if len(trunk_projected) >= 2:
+        trunk_proj_cov = np.cov(trunk_projected.T)
+        trunk_eigenvals, trunk_eigenvecs = np.linalg.eigh(trunk_proj_cov)
+        trunk_idx = np.argsort(trunk_eigenvals)[::-1]
+        
+        # 主干在投影空间中的主方向
+        trunk_main_dir_projected = trunk_eigenvecs[:, trunk_idx[0]]
+    else:
+        trunk_main_dir_projected = np.array([1, 0, 0])
+        trunk_main_dir_projected = trunk_main_dir_projected - np.dot(trunk_main_dir_projected, branch_plane_normal) * branch_plane_normal
+    
+    # 确保主干主方向是单位向量
+    trunk_main_dir_projected = trunk_main_dir_projected / (np.linalg.norm(trunk_main_dir_projected) + 1e-8)
+    
+    # 4. 构建初始平面的坐标系
+    plane_normal = branch_plane_normal
+    u_axis = trunk_main_dir_projected
+    v_axis = np.cross(plane_normal, u_axis)
+    v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
+    u_axis = np.cross(v_axis, plane_normal)
+    u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
+    
+    # 5. 在平面上生成32x32的正方形网格，间隔为point_spacing
+    grid_extent = (grid_size - 1) * point_spacing / 2
+    u_coords = np.linspace(-grid_extent, grid_extent, grid_size)
+    v_coords = np.linspace(-grid_extent, grid_extent, grid_size)
+    U, V = np.meshgrid(u_coords, v_coords)
+    
+    # 将网格点转换到3D空间
+    grid_points = []
+    for i in range(grid_size):
+        for j in range(grid_size):
+            point_3d = plane_center + U[i,j] * u_axis + V[i,j] * v_axis
+            grid_points.append(point_3d)
+    
+    # 转换为torch tensor
+    initial_points = np.array(grid_points).flatten()
+    x = torch.tensor(initial_points, dtype=torch.float32, device=device).unsqueeze(0)
+    
+    print(f"GIF模式 - 初始平面信息:")
+    print(f"  平面中心: {plane_center}")
+    print(f"  分支平面法向量: {branch_plane_normal}")
+    print(f"  主干主方向: {trunk_main_dir_projected}")
+    print(f"  网格范围: {grid_extent*2:.2f} x {grid_extent*2:.2f}, 点间距: {point_spacing}")
     
     frames=[]
     # precompute point sets for scatter
-    trunk_pts, br1_pts, br2_pts = find_max_points_branches(td)
     branch_pts = np.vstack([br1_pts, br2_pts])
 
     with torch.no_grad():
@@ -235,35 +467,69 @@ def denoise_with_gif(tree_json:str, model:CondNoisePredictor, betas:torch.Tensor
             # 将当前点云重塑为(grid_size, grid_size, 3)格式
             current_points = x.squeeze().cpu().numpy().reshape(grid_size, grid_size, 3)
             
-            fig = plt.figure(figsize=(8,8))
+            fig = plt.figure(figsize=(12,8))
             ax = fig.add_subplot(111, projection='3d')
             
             # 绘制原始血管点
-            ax.scatter(*trunk_pts.T,  c='blue',  s=2, alpha=0.6)
-            ax.scatter(*br1_pts.T,    c='green', s=2, alpha=0.6)
-            ax.scatter(*br2_pts.T,    c='red',   s=2, alpha=0.6)
+            ax.scatter(*trunk_pts.T,  c='blue',  s=2, alpha=0.6, label='主干')
+            ax.scatter(*br1_pts.T,    c='green', s=2, alpha=0.6, label='分支1')
+            ax.scatter(*br2_pts.T,    c='red',   s=2, alpha=0.6, label='分支2')
+            
+            # 绘制初始平面（半透明）
+            plane_size = grid_extent * 1.5
+            plane_u = np.linspace(-plane_size, plane_size, 10)
+            plane_v = np.linspace(-plane_size, plane_size, 10)
+            Plane_U, Plane_V = np.meshgrid(plane_u, plane_v)
+            
+            plane_points = np.zeros((10, 10, 3))
+            for i in range(10):
+                for j in range(10):
+                    plane_points[i, j] = plane_center + Plane_U[i,j] * u_axis + Plane_V[i,j] * v_axis
+            
+            ax.plot_surface(plane_points[:,:,0], plane_points[:,:,1], plane_points[:,:,2], 
+                          alpha=0.2, color='yellow', label='初始平面')
+            
+            # 绘制分支主平面（用于对比）
+            branch_plane_points = np.zeros((10, 10, 3))
+            # 构建分支平面的坐标系
+            if abs(np.dot(branch_plane_normal, np.array([1, 0, 0]))) < 0.9:
+                branch_u = np.cross(branch_plane_normal, np.array([1, 0, 0]))
+            else:
+                branch_u = np.cross(branch_plane_normal, np.array([0, 1, 0]))
+            branch_u = branch_u / np.linalg.norm(branch_u)
+            branch_v = np.cross(branch_plane_normal, branch_u)
+            branch_v = branch_v / np.linalg.norm(branch_v)
+            
+            for i in range(10):
+                for j in range(10):
+                    branch_plane_points[i, j] = branch_center + Plane_U[i,j] * branch_u + Plane_V[i,j] * branch_v
+            
+            ax.plot_surface(branch_plane_points[:,:,0], branch_plane_points[:,:,1], branch_plane_points[:,:,2], 
+                          alpha=0.1, color='cyan', label='分支主平面')
             
             # 绘制当前预测的点云
             points_flat = current_points.reshape(-1, 3)
-            ax.scatter(*points_flat.T, c='orange', s=1, alpha=0.8)
+            ax.scatter(*points_flat.T, c='orange', s=3, alpha=0.8, label='扩散点云')
             
             # 绘制点云的网格线以显示结构
             for i in range(0, grid_size, 4):  # 每4行绘制一条线
                 line_points = current_points[i, :, :]
                 ax.plot(line_points[:, 0], line_points[:, 1], line_points[:, 2], 
-                       color='red', alpha=0.3, linewidth=0.5)
+                       color='red', alpha=0.5, linewidth=1)
             for j in range(0, grid_size, 4):  # 每4列绘制一条线
                 line_points = current_points[:, j, :]
                 ax.plot(line_points[:, 0], line_points[:, 1], line_points[:, 2], 
-                       color='red', alpha=0.3, linewidth=0.5)
+                       color='red', alpha=0.5, linewidth=1)
 
             # 设置视图
-            cen_branch = branch_pts.mean(axis=0)
-            ax.set_xlim(cen_branch[0]-40, cen_branch[0]+40)
-            ax.set_ylim(cen_branch[1]-40, cen_branch[1]+40)
-            ax.set_zlim(cen_branch[2]-40, cen_branch[2]+40)
-            ax.set_title(f'Denoising Step: {T-t_inv-1}/{T}')
-            ax.set_axis_off()
+            all_points_view = np.vstack([trunk_pts, br1_pts, br2_pts, points_flat])
+            center_view = all_points_view.mean(axis=0)
+            range_val = 40
+            ax.set_xlim(center_view[0]-range_val, center_view[0]+range_val)
+            ax.set_ylim(center_view[1]-range_val, center_view[1]+range_val)
+            ax.set_zlim(center_view[2]-range_val, center_view[2]+range_val)
+            ax.set_title(f'去噪步骤: {T-t_inv-1}/{T}\n初始平面：经过主干最多，与分支平面垂直\n网格: {grid_size}x{grid_size}, 间距: {point_spacing}')
+            ax.legend()
             
             fig.canvas.draw()
             frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
@@ -608,17 +874,462 @@ def comprehensive_surface_validation(tree_json: str, generated_points: np.ndarra
     
     return metrics
 
+def visualize_optimal_plane(tree_json: str, grid_size=32, point_spacing=0.2, save_path: str = None):
+    """
+    可视化找到的最优初始平面和初始网格点分布
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    with open(tree_json,'r') as fp:
+        td=json.load(fp)
+    
+    # 获取主干点和分支点
+    trunk_pts, br1_pts, br2_pts = find_max_points_branches(td)
+    all_branch_pts = np.vstack([br1_pts, br2_pts])
+    
+    # 1. 计算所有点的中心作为平面中心
+    all_points = np.vstack([trunk_pts, br1_pts, br2_pts])
+    plane_center = all_points.mean(axis=0)
+    
+    # 2. 找到经过分支最多的平面（分支点的主平面）
+    branch_center = all_branch_pts.mean(axis=0)
+    branch_centered = all_branch_pts - branch_center
+    
+    # 计算分支点的主平面法向量
+    if len(branch_centered) >= 3:
+        branch_cov = np.cov(branch_centered.T)
+        branch_eigenvals, branch_eigenvecs = np.linalg.eigh(branch_cov)
+        branch_idx = np.argsort(branch_eigenvals)[::-1]
+        
+        # 分支主平面由前两个主成分确定，法向量是第三个主成分
+        branch_plane_normal = branch_eigenvecs[:, branch_idx[2]]  # 最小特征值对应方向
+    else:
+        # 如果分支点太少，使用默认法向量
+        branch_plane_normal = np.array([0, 0, 1])
+    
+    # 确保法向量是单位向量
+    branch_plane_normal = branch_plane_normal / np.linalg.norm(branch_plane_normal)
+    
+    # 3. 找到与分支平面垂直且经过主干最多的平面
+    trunk_center = trunk_pts.mean(axis=0)
+    trunk_centered = trunk_pts - trunk_center
+    
+    # 将主干点投影到垂直于分支平面法向量的空间中
+    projection_matrix = np.eye(3) - np.outer(branch_plane_normal, branch_plane_normal)
+    trunk_projected = trunk_centered @ projection_matrix.T
+    
+    # 在投影空间中找主干点的主方向
+    if len(trunk_projected) >= 2:
+        trunk_proj_cov = np.cov(trunk_projected.T)
+        trunk_eigenvals, trunk_eigenvecs = np.linalg.eigh(trunk_proj_cov)
+        trunk_idx = np.argsort(trunk_eigenvals)[::-1]
+        
+        # 主干在投影空间中的主方向
+        trunk_main_dir_projected = trunk_eigenvecs[:, trunk_idx[0]]
+    else:
+        trunk_main_dir_projected = np.array([1, 0, 0])
+        trunk_main_dir_projected = trunk_main_dir_projected - np.dot(trunk_main_dir_projected, branch_plane_normal) * branch_plane_normal
+    
+    # 确保主干主方向是单位向量
+    trunk_main_dir_projected = trunk_main_dir_projected / (np.linalg.norm(trunk_main_dir_projected) + 1e-8)
+    
+    # 4. 构建初始平面的坐标系
+    plane_normal = branch_plane_normal
+    u_axis = trunk_main_dir_projected
+    v_axis = np.cross(plane_normal, u_axis)
+    v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
+    u_axis = np.cross(v_axis, plane_normal)
+    u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
+    
+    # 5. 在平面上生成32x32的正方形网格，间隔为point_spacing
+    grid_extent = (grid_size - 1) * point_spacing / 2
+    u_coords = np.linspace(-grid_extent, grid_extent, grid_size)
+    v_coords = np.linspace(-grid_extent, grid_extent, grid_size)
+    U, V = np.meshgrid(u_coords, v_coords)
+    
+    # 将网格点转换到3D空间
+    grid_points = []
+    for i in range(grid_size):
+        for j in range(grid_size):
+            point_3d = plane_center + U[i,j] * u_axis + V[i,j] * v_axis
+            grid_points.append(point_3d)
+    
+    grid_points = np.array(grid_points)
+    
+    # 构建分支平面的坐标系用于可视化
+    if abs(np.dot(branch_plane_normal, np.array([1, 0, 0]))) < 0.9:
+        branch_u = np.cross(branch_plane_normal, np.array([1, 0, 0]))
+    else:
+        branch_u = np.cross(branch_plane_normal, np.array([0, 1, 0]))
+    branch_u = branch_u / np.linalg.norm(branch_u)
+    branch_v = np.cross(branch_plane_normal, branch_u)
+    branch_v = branch_v / np.linalg.norm(branch_v)
+    
+    # 可视化
+    fig = plt.figure(figsize=(20, 6))
+    
+    # 子图1: 分支主平面分析
+    ax1 = fig.add_subplot(141, projection='3d')
+    ax1.scatter(*trunk_pts.T, c='blue', s=3, alpha=0.8, label='主干')
+    ax1.scatter(*br1_pts.T, c='green', s=3, alpha=0.8, label='分支1')
+    ax1.scatter(*br2_pts.T, c='red', s=3, alpha=0.8, label='分支2')
+    
+    # 绘制分支主平面
+    plane_size = grid_extent * 1.5
+    plane_u = np.linspace(-plane_size, plane_size, 20)
+    plane_v = np.linspace(-plane_size, plane_size, 20)
+    Plane_U, Plane_V = np.meshgrid(plane_u, plane_v)
+    
+    branch_plane_points = np.zeros((20, 20, 3))
+    for i in range(20):
+        for j in range(20):
+            branch_plane_points[i, j] = branch_center + Plane_U[i,j] * branch_u + Plane_V[i,j] * branch_v
+    
+    ax1.plot_surface(branch_plane_points[:,:,0], branch_plane_points[:,:,1], branch_plane_points[:,:,2], 
+                    alpha=0.3, color='cyan')
+    ax1.set_title('分支主平面\n(经过分支最多的平面)')
+    ax1.legend()
+    ax1.set_axis_off()
+    
+    # 子图2: 初始平面位置
+    ax2 = fig.add_subplot(142, projection='3d')
+    ax2.scatter(*trunk_pts.T, c='blue', s=3, alpha=0.8, label='主干')
+    ax2.scatter(*br1_pts.T, c='green', s=3, alpha=0.8, label='分支1')
+    ax2.scatter(*br2_pts.T, c='red', s=3, alpha=0.8, label='分支2')
+    
+    # 绘制初始平面
+    initial_plane_points = np.zeros((20, 20, 3))
+    for i in range(20):
+        for j in range(20):
+            initial_plane_points[i, j] = plane_center + Plane_U[i,j] * u_axis + Plane_V[i,j] * v_axis
+    
+    ax2.plot_surface(initial_plane_points[:,:,0], initial_plane_points[:,:,1], initial_plane_points[:,:,2], 
+                    alpha=0.4, color='yellow')
+    
+    # 绘制分支平面（半透明对比）
+    ax2.plot_surface(branch_plane_points[:,:,0], branch_plane_points[:,:,1], branch_plane_points[:,:,2], 
+                    alpha=0.1, color='cyan')
+    
+    ax2.set_title('初始平面\n(与分支平面垂直，经过主干最多)')
+    ax2.legend()
+    ax2.set_axis_off()
+    
+    # 子图3: 初始网格点
+    ax3 = fig.add_subplot(143, projection='3d')
+    ax3.scatter(*trunk_pts.T, c='blue', s=2, alpha=0.5, label='主干')
+    ax3.scatter(*br1_pts.T, c='green', s=2, alpha=0.5, label='分支1')
+    ax3.scatter(*br2_pts.T, c='red', s=2, alpha=0.5, label='分支2')
+    ax3.scatter(*grid_points.T, c='orange', s=5, alpha=0.8, label='初始网格点')
+    
+    # 绘制网格线
+    grid_reshaped = grid_points.reshape(grid_size, grid_size, 3)
+    for i in range(0, grid_size, 4):
+        line_points = grid_reshaped[i, :, :]
+        ax3.plot(line_points[:, 0], line_points[:, 1], line_points[:, 2], 
+               color='red', alpha=0.7, linewidth=1)
+    for j in range(0, grid_size, 4):
+        line_points = grid_reshaped[:, j, :]
+        ax3.plot(line_points[:, 0], line_points[:, 1], line_points[:, 2], 
+               color='red', alpha=0.7, linewidth=1)
+    
+    ax3.set_title(f'初始网格: {grid_size}×{grid_size}\n间距: {point_spacing}')
+    ax3.legend()
+    ax3.set_axis_off()
+    
+    # 子图4: 平面视图（从分支平面法向量方向看）
+    ax4 = fig.add_subplot(144)
+    
+    # 将所有点投影到初始平面上
+    trunk_proj = np.array([np.dot(pt - plane_center, u_axis) for pt in trunk_pts]), \
+                 np.array([np.dot(pt - plane_center, v_axis) for pt in trunk_pts])
+    br1_proj = np.array([np.dot(pt - plane_center, u_axis) for pt in br1_pts]), \
+               np.array([np.dot(pt - plane_center, v_axis) for pt in br1_pts])
+    br2_proj = np.array([np.dot(pt - plane_center, u_axis) for pt in br2_pts]), \
+               np.array([np.dot(pt - plane_center, v_axis) for pt in br2_pts])
+    
+    ax4.scatter(*trunk_proj, c='blue', s=3, alpha=0.6, label='主干投影')
+    ax4.scatter(*br1_proj, c='green', s=3, alpha=0.6, label='分支1投影')
+    ax4.scatter(*br2_proj, c='red', s=3, alpha=0.6, label='分支2投影')
+    ax4.scatter(U.flatten(), V.flatten(), c='orange', s=8, alpha=0.8, label='网格点')
+    
+    # 绘制网格线
+    for i in range(0, grid_size, 4):
+        ax4.plot(U[i, :], V[i, :], color='red', alpha=0.5, linewidth=1)
+    for j in range(0, grid_size, 4):
+        ax4.plot(U[:, j], V[:, j], color='red', alpha=0.5, linewidth=1)
+    
+    ax4.set_title('初始平面视图')
+    ax4.set_xlabel('U轴（主干主方向）')
+    ax4.set_ylabel('V轴')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    ax4.set_aspect('equal')
+    
+    # 统一设置3D视图范围
+    all_points_vis = np.vstack([trunk_pts, br1_pts, br2_pts, grid_points])
+    center = all_points_vis.mean(axis=0)
+    range_val = 30
+    
+    for ax in [ax1, ax2, ax3]:
+        ax.set_xlim(center[0] - range_val, center[0] + range_val)
+        ax.set_ylim(center[1] - range_val, center[1] + range_val)
+        ax.set_zlim(center[2] - range_val, center[2] + range_val)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"初始平面可视化已保存到: {save_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+    
+    print(f"初始平面信息:")
+    print(f"  平面中心: {plane_center}")
+    print(f"  分支平面法向量: {branch_plane_normal}")
+    print(f"  主干主方向（投影后）: {trunk_main_dir_projected}")
+    print(f"  初始平面法向量: {plane_normal}")
+    print(f"  网格尺寸: {grid_extent*2:.2f} × {grid_extent*2:.2f}")
+    print(f"  点间距: {point_spacing}")
+    
+    # 验证垂直性
+    dot_product = np.dot(plane_normal, branch_plane_normal)
+    print(f"  平面垂直性验证: {abs(dot_product):.6f} (接近0表示垂直)")
+    
+    return plane_center, plane_normal, u_axis, v_axis, grid_points
+
+def visualize_training_target_surface(tree_json: str, grid_size=32, point_spacing=0.2, save_path: str = None):
+    """
+    可视化训练目标曲面（以中轴线为骨架的曲面）
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    with open(tree_json,'r') as fp:
+        td=json.load(fp)
+    
+    # 获取主干和分支点
+    trunk_pts, br1_pts, br2_pts = find_max_points_branches(td)
+    
+    # 计算两个分支对应点的中点，构建中轴线
+    min_len = min(len(br1_pts), len(br2_pts))
+    if min_len > 0:
+        br1_sampled = br1_pts[:min_len]
+        br2_sampled = br2_pts[:min_len]
+        midpoints = (br1_sampled + br2_sampled) / 2.0
+    else:
+        midpoints = np.array([trunk_pts[-1]])
+    
+    # 构建中轴线：主干点 + 分支中点
+    centerline_points = np.vstack([trunk_pts, midpoints])
+    
+    # 对中轴线点进行排序，确保连续性
+    centerline_center = centerline_points.mean(axis=0)
+    centerline_centered = centerline_points - centerline_center
+    
+    # 使用PCA找到中轴线的主方向
+    cov_matrix = np.cov(centerline_centered.T)
+    eigenvals, eigenvecs = np.linalg.eig(cov_matrix)
+    idx = np.argsort(eigenvals)[::-1]
+    main_direction = eigenvecs[:, idx[0]]  # 中轴线主方向
+    
+    # 将中轴线点投影到主方向上并排序
+    projections = np.dot(centerline_centered, main_direction)
+    sorted_indices = np.argsort(projections)
+    sorted_centerline = centerline_points[sorted_indices]
+    
+    # 创建临时dataset实例来生成曲面
+    class TempDataset:
+        def _generate_surface_grid(self, centerline_points, main_direction, grid_size, point_spacing):
+            # 与Dataset中相同的逻辑
+            grid_extent = (grid_size - 1) * point_spacing / 2
+            
+            axis_positions = []
+            for i in range(grid_size):
+                t = i / (grid_size - 1)
+                axis_pos = self._interpolate_on_centerline(centerline_points, t)
+                axis_positions.append(axis_pos)
+            
+            axis_positions = np.array(axis_positions)
+            surface_points = np.zeros((grid_size, grid_size, 3))
+            
+            for i, axis_pos in enumerate(axis_positions):
+                if i == 0:
+                    tangent = axis_positions[1] - axis_positions[0]
+                elif i == grid_size - 1:
+                    tangent = axis_positions[-1] - axis_positions[-2]
+                else:
+                    tangent = axis_positions[i+1] - axis_positions[i-1]
+                
+                tangent = tangent / (np.linalg.norm(tangent) + 1e-8)
+                
+                if abs(np.dot(tangent, np.array([1, 0, 0]))) < 0.9:
+                    base_vector = np.array([1, 0, 0])
+                else:
+                    base_vector = np.array([0, 1, 0])
+                
+                u_axis = np.cross(tangent, base_vector)
+                u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
+                
+                v_axis = np.cross(tangent, u_axis)
+                v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
+                
+                for j in range(grid_size):
+                    offset = (j / (grid_size - 1) - 0.5) * 2 * grid_extent
+                    point_on_surface = axis_pos + offset * u_axis
+                    curvature_factor = 0.1 * abs(offset) * np.sin(i * np.pi / grid_size)
+                    point_on_surface += curvature_factor * v_axis
+                    surface_points[i, j] = point_on_surface
+            
+            return surface_points
+        
+        def _interpolate_on_centerline(self, centerline_points, t):
+            if len(centerline_points) == 1:
+                return centerline_points[0]
+            
+            cumulative_lengths = [0]
+            for i in range(1, len(centerline_points)):
+                dist = np.linalg.norm(centerline_points[i] - centerline_points[i-1])
+                cumulative_lengths.append(cumulative_lengths[-1] + dist)
+            
+            total_length = cumulative_lengths[-1]
+            target_length = t * total_length
+            
+            for i in range(len(cumulative_lengths) - 1):
+                if cumulative_lengths[i] <= target_length <= cumulative_lengths[i+1]:
+                    segment_t = (target_length - cumulative_lengths[i]) / (cumulative_lengths[i+1] - cumulative_lengths[i])
+                    return centerline_points[i] + segment_t * (centerline_points[i+1] - centerline_points[i])
+            
+            if t <= 0:
+                return centerline_points[0]
+            else:
+                return centerline_points[-1]
+    
+    # 生成训练目标曲面
+    temp_dataset = TempDataset()
+    target_surface = temp_dataset._generate_surface_grid(
+        sorted_centerline, main_direction, grid_size, point_spacing
+    )
+    
+    # 可视化
+    fig = plt.figure(figsize=(20, 6))
+    
+    # 子图1: 中轴线和血管点
+    ax1 = fig.add_subplot(141, projection='3d')
+    ax1.scatter(*trunk_pts.T, c='blue', s=3, alpha=0.8, label='主干')
+    ax1.scatter(*br1_pts.T, c='green', s=3, alpha=0.8, label='分支1')
+    ax1.scatter(*br2_pts.T, c='red', s=3, alpha=0.8, label='分支2')
+    ax1.scatter(*midpoints.T, c='purple', s=5, alpha=0.9, label='分支中点')
+    ax1.plot(*sorted_centerline.T, 'orange', linewidth=3, alpha=0.8, label='中轴线')
+    ax1.set_title('中轴线构建')
+    ax1.legend()
+    ax1.set_axis_off()
+    
+    # 子图2: 目标曲面
+    ax2 = fig.add_subplot(142, projection='3d')
+    X, Y, Z = target_surface[:, :, 0], target_surface[:, :, 1], target_surface[:, :, 2]
+    ax2.plot_surface(X, Y, Z, alpha=0.7, cmap='viridis')
+    ax2.plot(*sorted_centerline.T, 'red', linewidth=3, alpha=1.0, label='中轴线')
+    ax2.set_title('训练目标曲面')
+    ax2.legend()
+    ax2.set_axis_off()
+    
+    # 子图3: 曲面+血管叠加
+    ax3 = fig.add_subplot(143, projection='3d')
+    ax3.scatter(*trunk_pts.T, c='blue', s=2, alpha=0.6, label='主干')
+    ax3.scatter(*br1_pts.T, c='green', s=2, alpha=0.6, label='分支1')
+    ax3.scatter(*br2_pts.T, c='red', s=2, alpha=0.6, label='分支2')
+    ax3.plot_surface(X, Y, Z, alpha=0.4, color='orange')
+    ax3.plot(*sorted_centerline.T, 'purple', linewidth=2, alpha=0.8)
+    
+    # 绘制网格线显示结构
+    for i in range(0, grid_size, 4):
+        ax3.plot(X[i, :], Y[i, :], Z[i, :], 'k-', alpha=0.3, linewidth=0.5)
+    for j in range(0, grid_size, 4):
+        ax3.plot(X[:, j], Y[:, j], Z[:, j], 'k-', alpha=0.3, linewidth=0.5)
+    
+    ax3.set_title('曲面与血管叠加')
+    ax3.legend()
+    ax3.set_axis_off()
+    
+    # 子图4: 网格点分布
+    ax4 = fig.add_subplot(144, projection='3d')
+    surface_points_flat = target_surface.reshape(-1, 3)
+    ax4.scatter(*surface_points_flat.T, c='orange', s=2, alpha=0.8, label='曲面网格点')
+    ax4.plot(*sorted_centerline.T, 'red', linewidth=2, alpha=0.8, label='中轴线')
+    
+    # 显示网格结构
+    for i in range(0, grid_size, 2):
+        line_points = target_surface[i, :, :]
+        ax4.plot(line_points[:, 0], line_points[:, 1], line_points[:, 2], 
+               'b-', alpha=0.5, linewidth=0.5)
+    for j in range(0, grid_size, 2):
+        line_points = target_surface[:, j, :]
+        ax4.plot(line_points[:, 0], line_points[:, 1], line_points[:, 2], 
+               'g-', alpha=0.5, linewidth=0.5)
+    
+    ax4.set_title(f'网格点分布\n{grid_size}×{grid_size}, 间距{point_spacing}')
+    ax4.legend()
+    ax4.set_axis_off()
+    
+    # 统一设置视图范围
+    all_points = np.vstack([trunk_pts, br1_pts, br2_pts, surface_points_flat])
+    center = all_points.mean(axis=0)
+    range_val = 30
+    
+    for ax in [ax1, ax2, ax3, ax4]:
+        ax.set_xlim(center[0] - range_val, center[0] + range_val)
+        ax.set_ylim(center[1] - range_val, center[1] + range_val)
+        ax.set_zlim(center[2] - range_val, center[2] + range_val)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"训练目标曲面可视化已保存到: {save_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+    
+    print(f"训练目标曲面信息:")
+    print(f"  中轴线点数: {len(sorted_centerline)}")
+    print(f"  曲面网格: {grid_size}×{grid_size}")
+    print(f"  点间距: {point_spacing}")
+    print(f"  曲面范围: {(grid_size-1)*point_spacing:.2f}")
+    print(f"  总点数: {grid_size*grid_size}")
+    
+    return target_surface, sorted_centerline
+
 if __name__=='__main__':
     import glob
     files = glob.glob('tree_*.json')
     if len(files):
         grid_size = 32
-        model, betas = train_tree_diffusion(files, epochs=50000, device='cpu', grid_size=grid_size)
-        pred = denoise_with_tree(files[0], model, betas, grid_size=grid_size)
-        pred_gif = denoise_with_gif(files[0], model, betas, gif_path='denoise.gif', grid_size=grid_size)
+        point_spacing = 0.2  # 可调节的点间距
+        
+        print("=== 可视化最优初始平面 ===")
+        visualize_optimal_plane(files[0], grid_size=grid_size, point_spacing=point_spacing, 
+                               save_path="optimal_plane_visualization.png")
+        
+        print("\n=== 可视化训练目标曲面 ===")
+        target_surface, centerline = visualize_training_target_surface(
+            files[0], grid_size=grid_size, point_spacing=point_spacing, 
+            save_path="training_target_surface.png"
+        )
+        
+        print("\n=== 开始训练扩散模型 ===")
+        model, betas = train_tree_diffusion(files, epochs=50000, device='cpu', grid_size=grid_size, point_spacing=point_spacing)
+        
+        print("\n=== 生成曲面 ===")
+        pred = denoise_with_tree(files[0], model, betas, device='cpu', grid_size=grid_size, point_spacing=point_spacing)
+        pred_gif = denoise_with_gif(files[0], model, betas, gif_path='denoise.gif', device='cpu', 
+                                  grid_size=grid_size, point_spacing=point_spacing)
         print('Predicted plane points shape:', pred.shape)  # (32, 32, 3)
         print('Final points center:', pred.mean(axis=(0,1))) 
         
         # 新增：综合验证生成的曲面
-        print("\n开始验证生成的曲面...")
+        print("\n=== 验证生成的曲面 ===")
         comprehensive_surface_validation(files[0], pred, "trained_surface") 
