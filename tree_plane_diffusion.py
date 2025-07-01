@@ -588,15 +588,16 @@ def safe_find_max_points_branches(tree_data):
         default_points = np.array([[0, 0, 0], [1, 0, 1], [0, 1, 2]], dtype=np.float32)
         return default_points, default_points, default_points
 
-def visualize_generated_surface(tree_json: str, generated_points: np.ndarray, save_path: str = None, show_wireframe: bool = True):
+def visualize_generated_surface(tree_json: str, generated_points: np.ndarray, save_path: str = None, show_wireframe: bool = True, interactive: bool = True):
     """
     可视化生成的曲面与原始血管树的对比
     
     Args:
         tree_json: 血管树json文件路径
         generated_points: 生成的曲面点，形状为(grid_size, grid_size, 3)
-        save_path: 保存图片的路径，如果为None则显示
+        save_path: 保存图片的路径，如果为None则不保存
         show_wireframe: 是否显示网格线
+        interactive: 是否显示交互式3D界面
     """
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D
@@ -669,13 +670,21 @@ def visualize_generated_surface(tree_json: str, generated_points: np.ndarray, sa
     
     plt.tight_layout()
     
+    # 保存图片（如果需要）
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"可视化结果已保存到: {save_path}")
-    else:
-        plt.show()
     
-    plt.close()
+    # 显示交互式界面（如果需要）
+    if interactive:
+        print("正在打开交互式3D可视化界面...")
+        print("您可以:")
+        print("- 拖拽旋转视角")
+        print("- 滚轮缩放")
+        print("- 关闭窗口继续程序执行")
+        plt.show()
+    else:
+        plt.close()
 
 def analyze_surface_quality(tree_json: str, generated_points: np.ndarray):
     """
@@ -821,7 +830,7 @@ def print_analysis_report(metrics: dict):
         print(f"   平均角度差: {normal['mean_angle_diff']:.4f} rad")
         print(f"   角度差标准差: {normal['std_angle_diff']:.4f} rad")
 
-def comprehensive_surface_validation(tree_json: str, generated_points: np.ndarray, save_prefix: str = "surface_validation"):
+def comprehensive_surface_validation(tree_json: str, generated_points: np.ndarray, save_prefix: str = "surface_validation", interactive: bool = True):
     """
     综合曲面验证：可视化 + 质量分析
     
@@ -829,12 +838,13 @@ def comprehensive_surface_validation(tree_json: str, generated_points: np.ndarra
         tree_json: 血管树json文件路径
         generated_points: 生成的曲面点，形状为(grid_size, grid_size, 3)
         save_prefix: 保存文件的前缀
+        interactive: 是否显示交互式3D界面
     """
     print("开始综合曲面验证...")
     
     # 1. 可视化
     print("1. 生成可视化图像...")
-    visualize_generated_surface(tree_json, generated_points, f"{save_prefix}_visualization.png")
+    visualize_generated_surface(tree_json, generated_points, f"{save_prefix}_visualization.png", interactive=interactive)
     
     # 2. 质量分析
     print("2. 进行质量分析...")
@@ -872,9 +882,12 @@ def comprehensive_surface_validation(tree_json: str, generated_points: np.ndarra
     print(f"- 可视化图像: {save_prefix}_visualization.png")
     print(f"- 质量指标: {save_prefix}_metrics.json")
     
+    if interactive:
+        print("交互式3D界面已显示，您可以从多个视角查看生成的曲面效果")
+    
     return metrics
 
-def visualize_optimal_plane(tree_json: str, grid_size=32, point_spacing=0.2, save_path: str = None):
+def visualize_optimal_plane(tree_json: str, grid_size=32, point_spacing=0.2, save_path: str = None, interactive: bool = True):
     """
     可视化找到的最优初始平面和初始网格点分布
     """
@@ -1078,13 +1091,18 @@ def visualize_optimal_plane(tree_json: str, grid_size=32, point_spacing=0.2, sav
     
     plt.tight_layout()
     
+    # 保存图片（如果需要）
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"初始平面可视化已保存到: {save_path}")
-    else:
-        plt.show()
     
-    plt.close()
+    # 显示交互式界面（如果需要）
+    if interactive:
+        print("正在打开初始平面分析的交互式3D界面...")
+        print("您可以从多个视角查看初始平面的构建过程")
+        plt.show()
+    else:
+        plt.close()
     
     print(f"初始平面信息:")
     print(f"  平面中心: {plane_center}")
@@ -1100,7 +1118,7 @@ def visualize_optimal_plane(tree_json: str, grid_size=32, point_spacing=0.2, sav
     
     return plane_center, plane_normal, u_axis, v_axis, grid_points
 
-def visualize_training_target_surface(tree_json: str, grid_size=32, point_spacing=0.2, save_path: str = None):
+def visualize_training_target_surface(tree_json: str, grid_size=32, point_spacing=0.2, save_path: str = None, interactive: bool = True):
     """
     可视化训练目标曲面（以中轴线为骨架的曲面）
     """
@@ -1286,13 +1304,18 @@ def visualize_training_target_surface(tree_json: str, grid_size=32, point_spacin
     
     plt.tight_layout()
     
+    # 保存图片（如果需要）
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"训练目标曲面可视化已保存到: {save_path}")
-    else:
-        plt.show()
     
-    plt.close()
+    # 显示交互式界面（如果需要）
+    if interactive:
+        print("正在打开训练目标曲面的交互式3D界面...")
+        print("您可以从多个视角查看训练目标曲面的构建过程")
+        plt.show()
+    else:
+        plt.close()
     
     print(f"训练目标曲面信息:")
     print(f"  中轴线点数: {len(sorted_centerline)}")
@@ -1303,25 +1326,94 @@ def visualize_training_target_surface(tree_json: str, grid_size=32, point_spacin
     
     return target_surface, sorted_centerline
 
+# --------- 快速演示交互式可视化 ---------
+
+def quick_demo_interactive_visualization(tree_json: str):
+    """
+    快速演示交互式3D可视化功能
+    """
+    print("=== 交互式3D可视化演示 ===")
+    print("即将依次展示多个交互式3D界面，您可以:")
+    print("- 用鼠标拖拽旋转视角")
+    print("- 用滚轮缩放")
+    print("- 关闭当前窗口查看下一个界面")
+    print("- 按Ctrl+C中断演示")
+    
+    input("按回车键开始演示...")
+    
+    try:
+        # 1. 展示最优初始平面
+        print("\n1. 最优初始平面分析")
+        visualize_optimal_plane(tree_json, grid_size=16, point_spacing=0.3, 
+                               save_path=None, interactive=True)
+        
+        # 2. 展示训练目标曲面  
+        print("\n2. 训练目标曲面")
+        target_surface, _ = visualize_training_target_surface(
+            tree_json, grid_size=16, point_spacing=0.3,
+            save_path=None, interactive=True
+        )
+        
+        # 3. 如果有训练好的模型，展示生成结果
+        print("\n3. 生成的曲面效果")
+        print("注意：此演示使用模拟数据，实际使用时需要训练好的模型")
+        
+        # 创建一个简单的模拟曲面用于演示
+        grid_size = 16
+        demo_surface = np.zeros((grid_size, grid_size, 3))
+        for i in range(grid_size):
+            for j in range(grid_size):
+                # 创建一个简单的波浪形曲面
+                x = (i - grid_size//2) * 0.5
+                y = (j - grid_size//2) * 0.5
+                z = 2 * np.sin(x * 0.5) * np.cos(y * 0.5)
+                demo_surface[i, j] = [x + 5, y + 5, z + 5]  # 偏移一下位置
+        
+        visualize_generated_surface(tree_json, demo_surface, 
+                                  save_path=None, interactive=True)
+        
+        print("\n演示完成！所有3D界面都支持交互式查看。")
+        
+    except KeyboardInterrupt:
+        print("\n演示被用户中断")
+    except Exception as e:
+        print(f"\n演示过程中发生错误: {e}")
+
 if __name__=='__main__':
     import glob
     files = glob.glob('tree_*.json')
     if len(files):
+        print(f"发现 {len(files)} 个血管树文件")
+        
+        # 添加快速演示选项
+        print("\n选择运行模式:")
+        print("1. 快速交互式3D可视化演示")
+        print("2. 完整训练和生成流程")
+        
+        choice = input("请输入选择 (1 或 2，默认为 2): ").strip()
+        
+        if choice == "1":
+            print("启动快速演示模式...")
+            quick_demo_interactive_visualization(files[0])
+            exit()
+        else:
+            print("启动完整训练流程...")
+        
         grid_size = 32
         point_spacing = 0.2  # 可调节的点间距
         
         print("=== 可视化最优初始平面 ===")
         visualize_optimal_plane(files[0], grid_size=grid_size, point_spacing=point_spacing, 
-                               save_path="optimal_plane_visualization.png")
+                               save_path="optimal_plane_visualization.png", interactive=True)
         
         print("\n=== 可视化训练目标曲面 ===")
         target_surface, centerline = visualize_training_target_surface(
             files[0], grid_size=grid_size, point_spacing=point_spacing, 
-            save_path="training_target_surface.png"
+            save_path="training_target_surface.png", interactive=True
         )
         
         print("\n=== 开始训练扩散模型 ===")
-        model, betas = train_tree_diffusion(files, epochs=50000, device='cpu', grid_size=grid_size, point_spacing=point_spacing)
+        model, betas = train_tree_diffusion(files, epochs=500, device='cpu', grid_size=grid_size, point_spacing=point_spacing)
         
         print("\n=== 生成曲面 ===")
         pred = denoise_with_tree(files[0], model, betas, device='cpu', grid_size=grid_size, point_spacing=point_spacing)
@@ -1332,4 +1424,4 @@ if __name__=='__main__':
         
         # 新增：综合验证生成的曲面
         print("\n=== 验证生成的曲面 ===")
-        comprehensive_surface_validation(files[0], pred, "trained_surface") 
+        comprehensive_surface_validation(files[0], pred, "trained_surface", interactive=True)
