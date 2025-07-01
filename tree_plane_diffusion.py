@@ -1333,7 +1333,7 @@ def quick_demo_interactive_visualization(tree_json: str):
     快速演示交互式3D可视化功能
     """
     print("=== 交互式3D可视化演示 ===")
-    print("即将依次展示多个交互式3D界面，您可以:")
+    print("即将依次展示4个交互式3D界面，您可以:")
     print("- 用鼠标拖拽旋转视角")
     print("- 用滚轮缩放")
     print("- 关闭当前窗口查看下一个界面")
@@ -1355,24 +1355,188 @@ def quick_demo_interactive_visualization(tree_json: str):
         )
         
         # 3. 如果有训练好的模型，展示生成结果
-        print("\n3. 生成的曲面效果")
-        print("注意：此演示使用模拟数据，实际使用时需要训练好的模型")
+        print("\n3. 基于中轴线的分隔曲面")
+        print("注意：此演示使用基于中轴线的模拟数据，实际使用时需要训练好的模型")
         
-        # 创建一个简单的模拟曲面用于演示
+        # 读取血管树数据并计算中轴线
+        with open(tree_json, 'r') as fp:
+            td = json.load(fp)
+        
+        trunk_pts, br1_pts, br2_pts = safe_find_max_points_branches(td)
+        
+        # 计算分支中点构建中轴线
+        min_len = min(len(br1_pts), len(br2_pts))
+        if min_len > 0:
+            br1_sampled = br1_pts[:min_len]
+            br2_sampled = br2_pts[:min_len]
+            midpoints = (br1_sampled + br2_sampled) / 2.0
+        else:
+            midpoints = np.array([trunk_pts[-1]])
+        
+        # 构建中轴线：主干点 + 分支中点
+        centerline_points = np.vstack([trunk_pts, midpoints])
+        centerline_center = centerline_points.mean(axis=0)
+        centerline_centered = centerline_points - centerline_center
+        
+        # 使用PCA找到中轴线的主方向
+        cov_matrix = np.cov(centerline_centered.T)
+        eigenvals, eigenvecs = np.linalg.eig(cov_matrix)
+        idx = np.argsort(eigenvals)[::-1]
+        main_direction = eigenvecs[:, idx[0]]  # 中轴线主方向
+        
+        # 将中轴线点投影到主方向上并排序
+        projections = np.dot(centerline_centered, main_direction)
+        sorted_indices = np.argsort(projections)
+        sorted_centerline = centerline_points[sorted_indices]
+        
+        print(f"中轴线信息: {len(sorted_centerline)} 个点，主方向: {main_direction}")
+        
+        # 创建基于中轴线的分隔曲面，有效分离两个分支
         grid_size = 16
         demo_surface = np.zeros((grid_size, grid_size, 3))
+        
+        # 分析两个分支的分布
+        br1_center = br1_pts.mean(axis=0)
+        br2_center = br2_pts.mean(axis=0)
+        centerline_center = sorted_centerline.mean(axis=0)
+        
+        # 方法：使用两个分支中心连线的垂直平分面作为分隔基准
+        branch_connection = br2_center - br1_center  # 从分支1指向分支2的向量
+        branch_midpoint = (br1_center + br2_center) / 2  # 两分支的中点
+        
+        # 分隔面法向量：两个分支中心的连线方向
+        if np.linalg.norm(branch_connection) > 1e-6:
+            separation_normal = branch_connection / np.linalg.norm(branch_connection)
+        else:
+            # 如果两个分支中心重合，使用分支点的主成分分析
+            all_branch_pts = np.vstack([br1_pts, br2_pts])
+            branch_centered = all_branch_pts - all_branch_pts.mean(axis=0)
+            if len(branch_centered) >= 3:
+                branch_cov = np.cov(branch_centered.T)
+                eigenvals, eigenvecs = np.linalg.eigh(branch_cov)
+                idx = np.argsort(eigenvals)[::-1]
+                separation_normal = eigenvecs[:, idx[0]]  # 最大变化方向
+            else:
+                separation_normal = np.array([1, 0, 0])
+        
+        # 构建分隔曲面的坐标系
+        # u轴：中轴线主方向在分隔面上的投影（沿血管走向）
+        centerline_proj = main_direction - np.dot(main_direction, separation_normal) * separation_normal
+        if np.linalg.norm(centerline_proj) < 1e-6:
+            # 如果中轴线与分隔面法向量平行，选择其他方向
+            temp_vec = np.array([0, 0, 1]) if abs(separation_normal[2]) < 0.9 else np.array([1, 0, 0])
+            centerline_proj = temp_vec - np.dot(temp_vec, separation_normal) * separation_normal
+        
+        u_axis = centerline_proj / np.linalg.norm(centerline_proj)
+        
+        # v轴：垂直于u轴和法向量
+        v_axis = np.cross(separation_normal, u_axis)
+        v_axis = v_axis / np.linalg.norm(v_axis)
+        
+        # 验证分离效果
+        br1_to_midpoint = br1_center - branch_midpoint
+        br2_to_midpoint = br2_center - branch_midpoint
+        br1_side = np.dot(br1_to_midpoint, separation_normal)
+        br2_side = np.dot(br2_to_midpoint, separation_normal)
+        
+        print(f"分支分离分析:")
+        print(f"  分支1中心: {br1_center}")
+        print(f"  分支2中心: {br2_center}")
+        print(f"  分支中点: {branch_midpoint}")
+        print(f"  分支连线向量: {branch_connection}")
+        print(f"  分隔面法向量: {separation_normal}")
+        print(f"  分支1到分隔面距离: {br1_side:.3f}")
+        print(f"  分支2到分隔面距离: {br2_side:.3f}")
+        print(f"  分支是否在两侧: {br1_side * br2_side < 0}")
+        
+        # 确保分隔面经过中轴线附近
+        # 将分隔面中心设置为中轴线中心和分支中点的加权平均
+        separation_center = 0.7 * centerline_center + 0.3 * branch_midpoint
+        
+        # 计算曲面尺寸
+        centerline_length = np.linalg.norm(sorted_centerline[-1] - sorted_centerline[0])
+        branch_separation = np.linalg.norm(branch_connection)
+        all_points = np.vstack([trunk_pts, br1_pts, br2_pts])
+        points_range = np.max(all_points, axis=0) - np.min(all_points, axis=0)
+        
+        # u方向：沿血管走向，覆盖整个中轴线
+        surface_extent_u = max(centerline_length * 1.5, points_range.max() * 1.0)
+        # v方向：垂直方向，足够覆盖分支范围
+        surface_extent_v = max(branch_separation * 2.0, points_range.max() * 0.8)
+        
+        print(f"  分隔面中心: {separation_center}")
+        print(f"  曲面尺寸: u={surface_extent_u:.2f}, v={surface_extent_v:.2f}")
+        
+        # 生成分隔曲面点
         for i in range(grid_size):
             for j in range(grid_size):
-                # 创建一个简单的波浪形曲面
-                x = (i - grid_size//2) * 0.5
-                y = (j - grid_size//2) * 0.5
-                z = 2 * np.sin(x * 0.5) * np.cos(y * 0.5)
-                demo_surface[i, j] = [x + 5, y + 5, z + 5]  # 偏移一下位置
+                # 参数化
+                u_param = (i / (grid_size - 1) - 0.5) * 2  # -1 到 1
+                v_param = (j / (grid_size - 1) - 0.5) * 2  # -1 到 1
+                
+                # 在分隔面上生成点
+                offset_u = u_param * surface_extent_u * 0.4
+                offset_v = v_param * surface_extent_v * 0.4
+                
+                # 基准位置：分隔面中心
+                base_point = separation_center
+                
+                # 如果要让曲面更贴合中轴线，可以在u方向上插值到中轴线
+                if len(sorted_centerline) > 1:
+                    # 将u参数映射到中轴线
+                    centerline_param = (u_param + 1) / 2  # 转换到0-1
+                    centerline_param = np.clip(centerline_param, 0, 1)
+                    
+                    if centerline_param <= 0:
+                        centerline_point = sorted_centerline[0]
+                    elif centerline_param >= 1:
+                        centerline_point = sorted_centerline[-1]
+                    else:
+                        idx_float = centerline_param * (len(sorted_centerline) - 1)
+                        idx_low = int(idx_float)
+                        idx_high = min(idx_low + 1, len(sorted_centerline) - 1)
+                        alpha = idx_float - idx_low
+                        centerline_point = (1 - alpha) * sorted_centerline[idx_low] + alpha * sorted_centerline[idx_high]
+                    
+                    # 将基准点调整为中轴线点在分隔面上的投影
+                    centerline_to_center = centerline_point - separation_center
+                    # 将中轴线点投影到分隔面上
+                    projected_offset = centerline_to_center - np.dot(centerline_to_center, separation_normal) * separation_normal
+                    base_point = separation_center + projected_offset * 0.8  # 部分跟随中轴线
+                
+                # 添加轻微的曲面弯曲，使其更自然
+                curvature = 0.1 * np.sin(u_param * np.pi) * np.cos(v_param * np.pi * 2)
+                
+                # 计算最终位置
+                point_3d = (base_point + 
+                           offset_u * u_axis + 
+                           offset_v * v_axis + 
+                           curvature * separation_normal)
+                
+                demo_surface[i, j] = point_3d
+        
+        print(f"分隔曲面信息:")
+        print(f"  曲面中心: {demo_surface.mean(axis=(0,1))}")
+        print(f"  u轴(沿血管): {u_axis}")
+        print(f"  v轴(垂直): {v_axis}")
+        print(f"  法向量(分离方向): {separation_normal}")
+        print(f"  目标：将绿色和红色分支分离到曲面两侧")
         
         visualize_generated_surface(tree_json, demo_surface, 
                                   save_path=None, interactive=True)
         
-        print("\n演示完成！所有3D界面都支持交互式查看。")
+        # 4. 详细验证分离效果
+        print("\n4. 分离效果详细验证")
+        print("显示详细的分离效果分析，包括统计数据和可视化")
+        visualize_separation_effect(tree_json, demo_surface, interactive=True)
+        
+        print("\n演示完成！")
+        print("您已经查看了4个交互式3D界面:")
+        print("1. 最优初始平面分析 - 显示如何选择初始平面")
+        print("2. 训练目标曲面 - 显示以中轴线为骨架的目标曲面") 
+        print("3. 基于中轴线的分隔曲面 - 显示用于分离分支的曲面")
+        print("4. 分离效果详细验证 - 显示分离效果的定量分析")
+        print("所有界面都支持交互式3D查看，便于从多角度理解算法原理。")
         
     except KeyboardInterrupt:
         print("\n演示被用户中断")
@@ -1388,7 +1552,12 @@ if __name__=='__main__':
         # 添加快速演示选项
         print("\n选择运行模式:")
         print("1. 快速交互式3D可视化演示")
+        print("   - 无需训练，立即查看4个交互式3D界面")
+        print("   - 包含：初始平面分析、目标曲面、分隔曲面、分离效果验证")
+        print("   - 推荐用于理解算法原理和调试")
         print("2. 完整训练和生成流程")
+        print("   - 包含完整的训练过程（训练轮数已调整为500轮以便快速测试）")
+        print("   - 最终会显示实际训练的结果")
         
         choice = input("请输入选择 (1 或 2，默认为 2): ").strip()
         
@@ -1425,3 +1594,180 @@ if __name__=='__main__':
         # 新增：综合验证生成的曲面
         print("\n=== 验证生成的曲面 ===")
         comprehensive_surface_validation(files[0], pred, "trained_surface", interactive=True)
+
+def visualize_separation_effect(tree_json: str, separation_surface: np.ndarray, interactive: bool = True):
+    """
+    专门用于验证和可视化分隔曲面的分离效果
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    # 读取原始血管数据
+    with open(tree_json, 'r') as fp:
+        td = json.load(fp)
+    
+    trunk_pts, br1_pts, br2_pts = safe_find_max_points_branches(td)
+    
+    # 计算分隔面参数
+    br1_center = br1_pts.mean(axis=0)
+    br2_center = br2_pts.mean(axis=0)
+    branch_midpoint = (br1_center + br2_center) / 2
+    branch_connection = br2_center - br1_center
+    
+    if np.linalg.norm(branch_connection) > 1e-6:
+        separation_normal = branch_connection / np.linalg.norm(branch_connection)
+    else:
+        separation_normal = np.array([1, 0, 0])
+    
+    # 计算曲面中心
+    surface_center = separation_surface.mean(axis=(0,1))
+    
+    # 创建大尺寸图形以便详细观察
+    fig = plt.figure(figsize=(20, 8))
+    
+    # 子图1: 总体视图
+    ax1 = fig.add_subplot(141, projection='3d')
+    
+    # 绘制血管点
+    ax1.scatter(*trunk_pts.T, c='blue', s=3, alpha=0.8, label='主干', marker='o')
+    ax1.scatter(*br1_pts.T, c='green', s=5, alpha=0.9, label='分支1', marker='^')
+    ax1.scatter(*br2_pts.T, c='red', s=5, alpha=0.9, label='分支2', marker='s')
+    
+    # 绘制分支中心
+    ax1.scatter(*br1_center, c='darkgreen', s=100, marker='*', label='分支1中心')
+    ax1.scatter(*br2_center, c='darkred', s=100, marker='*', label='分支2中心')
+    ax1.scatter(*branch_midpoint, c='purple', s=100, marker='D', label='分支中点')
+    
+    # 绘制分隔曲面
+    X, Y, Z = separation_surface[:, :, 0], separation_surface[:, :, 1], separation_surface[:, :, 2]
+    ax1.plot_surface(X, Y, Z, alpha=0.4, color='orange', label='分隔曲面')
+    
+    # 绘制分支连线
+    ax1.plot([br1_center[0], br2_center[0]], 
+             [br1_center[1], br2_center[1]], 
+             [br1_center[2], br2_center[2]], 
+             'purple', linewidth=3, alpha=0.8, label='分支连线')
+    
+    ax1.set_title('分支分离总视图')
+    ax1.legend()
+    ax1.set_axis_off()
+    
+    # 子图2: 沿分隔面法向量的侧视图
+    ax2 = fig.add_subplot(142, projection='3d')
+    
+    # 计算点到分隔面的距离
+    br1_distances = [np.dot(pt - surface_center, separation_normal) for pt in br1_pts]
+    br2_distances = [np.dot(pt - surface_center, separation_normal) for pt in br2_pts]
+    trunk_distances = [np.dot(pt - surface_center, separation_normal) for pt in trunk_pts]
+    
+    # 根据到分隔面的距离给点着色
+    br1_colors = ['lightgreen' if d < 0 else 'darkgreen' for d in br1_distances]
+    br2_colors = ['lightcoral' if d < 0 else 'darkred' for d in br2_distances]
+    
+    for i, (pt, color) in enumerate(zip(br1_pts, br1_colors)):
+        ax2.scatter(*pt, c=color, s=8, alpha=0.8)
+    for i, (pt, color) in enumerate(zip(br2_pts, br2_colors)):
+        ax2.scatter(*pt, c=color, s=8, alpha=0.8)
+    
+    ax2.scatter(*trunk_pts.T, c='blue', s=2, alpha=0.6)
+    ax2.plot_surface(X, Y, Z, alpha=0.3, color='orange')
+    
+    ax2.set_title('按分隔面分侧着色\n(浅色=负侧，深色=正侧)')
+    ax2.set_axis_off()
+    
+    # 子图3: 距离分布统计
+    ax3 = fig.add_subplot(143)
+    
+    ax3.hist(br1_distances, bins=20, alpha=0.7, color='green', label=f'分支1 (均值:{np.mean(br1_distances):.2f})')
+    ax3.hist(br2_distances, bins=20, alpha=0.7, color='red', label=f'分支2 (均值:{np.mean(br2_distances):.2f})')
+    ax3.axvline(0, color='orange', linestyle='--', linewidth=2, label='分隔面')
+    ax3.set_xlabel('到分隔面的距离')
+    ax3.set_ylabel('点数')
+    ax3.set_title('分支点到分隔面距离分布')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # 子图4: 分离效果量化
+    ax4 = fig.add_subplot(144)
+    
+    # 计算分离效果指标
+    br1_positive = sum(1 for d in br1_distances if d > 0)
+    br1_negative = sum(1 for d in br1_distances if d < 0)
+    br2_positive = sum(1 for d in br2_distances if d > 0)
+    br2_negative = sum(1 for d in br2_distances if d < 0)
+    
+    # 理想情况：两个分支应该在分隔面的不同侧
+    br1_majority_side = "正侧" if br1_positive > br1_negative else "负侧"
+    br2_majority_side = "正侧" if br2_positive > br2_negative else "负侧"
+    
+    separation_quality = "良好" if br1_majority_side != br2_majority_side else "需要改进"
+    
+    # 绘制分离统计
+    categories = ['分支1\n正侧', '分支1\n负侧', '分支2\n正侧', '分支2\n负侧']
+    values = [br1_positive, br1_negative, br2_positive, br2_negative]
+    colors = ['darkgreen', 'lightgreen', 'darkred', 'lightcoral']
+    
+    bars = ax4.bar(categories, values, color=colors, alpha=0.8)
+    ax4.set_ylabel('点数')
+    ax4.set_title(f'分离效果统计\n分离质量: {separation_quality}')
+    
+    # 添加数值标签
+    for bar, value in zip(bars, values):
+        ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, 
+                str(value), ha='center', va='bottom')
+    
+    ax4.grid(True, alpha=0.3)
+    
+    # 在图上添加分析文本
+    analysis_text = f"""分离分析:
+分支1: {br1_majority_side} ({br1_positive}/{br1_positive+br1_negative})
+分支2: {br2_majority_side} ({br2_positive}/{br2_positive+br2_negative})
+分离质量: {separation_quality}
+"""
+    
+    fig.text(0.02, 0.02, analysis_text, fontsize=10, 
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.8))
+    
+    # 统一设置3D视图范围
+    all_points = np.vstack([trunk_pts, br1_pts, br2_pts])
+    center = all_points.mean(axis=0)
+    range_val = 30
+    
+    for ax in [ax1, ax2]:
+        ax.set_xlim(center[0] - range_val, center[0] + range_val)
+        ax.set_ylim(center[1] - range_val, center[1] + range_val)
+        ax.set_zlim(center[2] - range_val, center[2] + range_val)
+    
+    plt.tight_layout()
+    
+    # 打印详细分析
+    print("\n" + "="*60)
+    print("分隔效果详细分析")
+    print("="*60)
+    print(f"分支1点数: {len(br1_pts)}")
+    print(f"  - 在分隔面正侧: {br1_positive} 个点")
+    print(f"  - 在分隔面负侧: {br1_negative} 个点")
+    print(f"  - 主要分布: {br1_majority_side}")
+    print(f"  - 距离均值: {np.mean(br1_distances):.3f}")
+    
+    print(f"\n分支2点数: {len(br2_pts)}")
+    print(f"  - 在分隔面正侧: {br2_positive} 个点")
+    print(f"  - 在分隔面负侧: {br2_negative} 个点")
+    print(f"  - 主要分布: {br2_majority_side}")
+    print(f"  - 距离均值: {np.mean(br2_distances):.3f}")
+    
+    print(f"\n分离效果评估:")
+    print(f"  - 两分支主要分布在不同侧: {br1_majority_side != br2_majority_side}")
+    print(f"  - 分离质量: {separation_quality}")
+    
+    if br1_majority_side == br2_majority_side:
+        print(f"  - 建议: 需要调整分隔面的位置或方向")
+    else:
+        print(f"  - 结果: 分隔曲面成功将两个分支分离")
+    
+    # 显示交互式界面（如果需要）
+    if interactive:
+        print("\n正在打开分离效果验证的交互式界面...")
+        plt.show()
+    else:
+        plt.close()
