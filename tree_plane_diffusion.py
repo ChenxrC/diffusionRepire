@@ -141,17 +141,22 @@ class TreeNormalDiffusionDataset(Dataset):
             v_axis = np.cross(tangent, u_axis)
             v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
             
+            # 绕切线向量旋转90度：交换u_axis和v_axis，并对其中一个取负
+            # 这相当于将坐标系绕tangent轴旋转90度
+            u_axis_rotated = v_axis      # 原来的v_axis成为新的u_axis
+            v_axis_rotated = -u_axis     # 原来的u_axis的负值成为新的v_axis
+            
             # 在垂直平面上生成32个点（一行）
             for j in range(grid_size):
                 # 从 -grid_extent 到 +grid_extent 均匀分布
                 offset = (j / (grid_size - 1) - 0.5) * 2 * grid_extent
                 
-                # 在垂直平面上的点
-                point_on_surface = axis_pos + offset * u_axis
+                # 使用旋转后的坐标系在垂直平面上的点
+                point_on_surface = axis_pos + offset * u_axis_rotated
                 
                 # 添加轻微的曲率变化，使其更像真实的血管曲面
                 curvature_factor = 0.1 * abs(offset) * np.sin(i * np.pi / grid_size)
-                point_on_surface += curvature_factor * v_axis
+                point_on_surface += curvature_factor * v_axis_rotated
                 
                 surface_points[i, j] = point_on_surface
         
@@ -1194,11 +1199,14 @@ def visualize_training_target_surface(tree_json: str, grid_size=32, point_spacin
                 v_axis = np.cross(tangent, u_axis)
                 v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
                 
+                u_axis_rotated = v_axis      # 原来的v_axis成为新的u_axis
+                v_axis_rotated = -u_axis 
+
                 for j in range(grid_size):
                     offset = (j / (grid_size - 1) - 0.5) * 2 * grid_extent
-                    point_on_surface = axis_pos + offset * u_axis
+                    point_on_surface = axis_pos + offset * u_axis_rotated
                     curvature_factor = 0.1 * abs(offset) * np.sin(i * np.pi / grid_size)
-                    point_on_surface += curvature_factor * v_axis
+                    point_on_surface += curvature_factor * v_axis_rotated
                     surface_points[i, j] = point_on_surface
             
             return surface_points
