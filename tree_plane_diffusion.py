@@ -8,7 +8,75 @@ from torch.utils.data import Dataset, DataLoader
 import pdb
 from visual import compute_tree_plane_normals, calculate_perpendicular_plane, find_max_points_branches, generate_noisy_normals
 from tree_plane_predictor import tree_points_to_array, PointEncoder
+# 创建临时dataset实例来生成曲面
+class TempDataset:
+    def _generate_surface_grid(self, centerline_points, main_direction, grid_size, point_spacing):
+        # 与Dataset中相同的逻辑
+        grid_extent = (grid_size - 1) * point_spacing / 2
+        
+        axis_positions = []
+        for i in range(grid_size):
+            t = i / (grid_size - 1)
+            axis_pos = self._interpolate_on_centerline(centerline_points, t)
+            axis_positions.append(axis_pos)
+        
+        axis_positions = np.array(axis_positions)
+        surface_points = np.zeros((grid_size, grid_size, 3))
+        
+        for i, axis_pos in enumerate(axis_positions):
+            if i == 0:
+                tangent = axis_positions[1] - axis_positions[0]
+            elif i == grid_size - 1:
+                tangent = axis_positions[-1] - axis_positions[-2]
+            else:
+                tangent = axis_positions[i+1] - axis_positions[i-1]
+            
+            tangent = tangent / (np.linalg.norm(tangent) + 1e-8)
+            
+            if abs(np.dot(tangent, np.array([1, 0, 0]))) < 0.9:
+                base_vector = np.array([1, 0, 0])
+            else:
+                base_vector = np.array([0, 1, 0])
+            
+            u_axis = np.cross(tangent, base_vector)
+            u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
+            
+            v_axis = np.cross(tangent, u_axis)
+            v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
+            
+            u_axis_rotated = v_axis      # 原来的v_axis成为新的u_axis
+            v_axis_rotated = -u_axis 
 
+            for j in range(grid_size):
+                offset = (j / (grid_size - 1) - 0.5) * 2 * grid_extent
+                point_on_surface = axis_pos + offset * u_axis_rotated
+                curvature_factor = 0.1 * abs(offset) * np.sin(i * np.pi / grid_size)
+                point_on_surface += curvature_factor * v_axis_rotated
+                surface_points[i, j] = point_on_surface
+        
+        return surface_points
+    
+    def _interpolate_on_centerline(self, centerline_points, t):
+        if len(centerline_points) == 1:
+            return centerline_points[0]
+        
+        cumulative_lengths = [0]
+        for i in range(1, len(centerline_points)):
+            dist = np.linalg.norm(centerline_points[i] - centerline_points[i-1])
+            cumulative_lengths.append(cumulative_lengths[-1] + dist)
+        
+        total_length = cumulative_lengths[-1]
+        target_length = t * total_length
+        
+        for i in range(len(cumulative_lengths) - 1):
+            if cumulative_lengths[i] <= target_length <= cumulative_lengths[i+1]:
+                segment_t = (target_length - cumulative_lengths[i]) / (cumulative_lengths[i+1] - cumulative_lengths[i])
+                return centerline_points[i] + segment_t * (centerline_points[i+1] - centerline_points[i])
+        
+        if t <= 0:
+            return centerline_points[0]
+        else:
+            return centerline_points[-1]
 # --------- Noise schedule utilities ---------
 
 def linear_beta_schedule(T:int, beta_start:float=1e-4, beta_end:float=2e-2):
@@ -1163,75 +1231,7 @@ def visualize_training_target_surface(tree_json: str, grid_size=32, point_spacin
     sorted_indices = np.argsort(projections)
     sorted_centerline = centerline_points[sorted_indices]
     
-    # 创建临时dataset实例来生成曲面
-    class TempDataset:
-        def _generate_surface_grid(self, centerline_points, main_direction, grid_size, point_spacing):
-            # 与Dataset中相同的逻辑
-            grid_extent = (grid_size - 1) * point_spacing / 2
-            
-            axis_positions = []
-            for i in range(grid_size):
-                t = i / (grid_size - 1)
-                axis_pos = self._interpolate_on_centerline(centerline_points, t)
-                axis_positions.append(axis_pos)
-            
-            axis_positions = np.array(axis_positions)
-            surface_points = np.zeros((grid_size, grid_size, 3))
-            
-            for i, axis_pos in enumerate(axis_positions):
-                if i == 0:
-                    tangent = axis_positions[1] - axis_positions[0]
-                elif i == grid_size - 1:
-                    tangent = axis_positions[-1] - axis_positions[-2]
-                else:
-                    tangent = axis_positions[i+1] - axis_positions[i-1]
-                
-                tangent = tangent / (np.linalg.norm(tangent) + 1e-8)
-                
-                if abs(np.dot(tangent, np.array([1, 0, 0]))) < 0.9:
-                    base_vector = np.array([1, 0, 0])
-                else:
-                    base_vector = np.array([0, 1, 0])
-                
-                u_axis = np.cross(tangent, base_vector)
-                u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
-                
-                v_axis = np.cross(tangent, u_axis)
-                v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
-                
-                u_axis_rotated = v_axis      # 原来的v_axis成为新的u_axis
-                v_axis_rotated = -u_axis 
-
-                for j in range(grid_size):
-                    offset = (j / (grid_size - 1) - 0.5) * 2 * grid_extent
-                    point_on_surface = axis_pos + offset * u_axis_rotated
-                    curvature_factor = 0.1 * abs(offset) * np.sin(i * np.pi / grid_size)
-                    point_on_surface += curvature_factor * v_axis_rotated
-                    surface_points[i, j] = point_on_surface
-            
-            return surface_points
-        
-        def _interpolate_on_centerline(self, centerline_points, t):
-            if len(centerline_points) == 1:
-                return centerline_points[0]
-            
-            cumulative_lengths = [0]
-            for i in range(1, len(centerline_points)):
-                dist = np.linalg.norm(centerline_points[i] - centerline_points[i-1])
-                cumulative_lengths.append(cumulative_lengths[-1] + dist)
-            
-            total_length = cumulative_lengths[-1]
-            target_length = t * total_length
-            
-            for i in range(len(cumulative_lengths) - 1):
-                if cumulative_lengths[i] <= target_length <= cumulative_lengths[i+1]:
-                    segment_t = (target_length - cumulative_lengths[i]) / (cumulative_lengths[i+1] - cumulative_lengths[i])
-                    return centerline_points[i] + segment_t * (centerline_points[i+1] - centerline_points[i])
-            
-            if t <= 0:
-                return centerline_points[0]
-            else:
-                return centerline_points[-1]
+    
     
     # 生成训练目标曲面
     temp_dataset = TempDataset()
@@ -1590,7 +1590,7 @@ if __name__=='__main__':
         )
         
         print("\n=== 开始训练扩散模型 ===")
-        model, betas = train_tree_diffusion(files, epochs=500, device='cpu', grid_size=grid_size, point_spacing=point_spacing)
+        model, betas = train_tree_diffusion(files, epochs=100000, device='cpu', grid_size=grid_size, point_spacing=point_spacing)
         
         print("\n=== 生成曲面 ===")
         pred = denoise_with_tree(files[0], model, betas, device='cpu', grid_size=grid_size, point_spacing=point_spacing)
