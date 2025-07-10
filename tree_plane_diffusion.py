@@ -1779,3 +1779,5 @@ def visualize_separation_effect(tree_json: str, separation_surface: np.ndarray, 
         plt.show()
     else:
         plt.close()
+
+print("测试merge")
