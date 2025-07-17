@@ -8,6 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 import pdb
 from visual import compute_tree_plane_normals, calculate_perpendicular_plane, find_max_points_branches, generate_noisy_normals
 from tree_plane_predictor import tree_points_to_array, PointEncoder
+from cascade_transform import apply_cascade_transform_to_branches
 # 创建临时dataset实例来生成曲面
 class TempDataset:
     def _generate_surface_grid(self, centerline_points, main_direction, grid_size, point_spacing):
@@ -110,47 +111,52 @@ class TreeNormalDiffusionDataset(Dataset):
         for f in json_files:
             with open(f,'r') as fp:
                 td=json.load(fp)
-            pts = tree_points_to_array(td)
-            self.data.append(pts)
-            
-            # 获取主干和分支点
-            trunk_pts, br1_pts, br2_pts = find_max_points_branches(td)
-            
-            # 计算两个分支对应点的中点，构建中轴线
-            min_len = min(len(br1_pts), len(br2_pts))
-            if min_len > 0:
-                # 取相同数量的点来计算中点
-                br1_sampled = br1_pts[:min_len]
-                br2_sampled = br2_pts[:min_len]
-                midpoints = (br1_sampled + br2_sampled) / 2.0
-            else:
-                # 如果没有分支点，使用主干末端作为中点
-                midpoints = np.array([trunk_pts[-1]])
-            
-            # 构建中轴线：主干点 + 分支中点
-            centerline_points = np.vstack([trunk_pts, midpoints])
-            
-            # 对中轴线点进行排序，确保连续性
-            centerline_center = centerline_points.mean(axis=0)
-            centerline_centered = centerline_points - centerline_center
-            
-            # 使用PCA找到中轴线的主方向
-            cov_matrix = np.cov(centerline_centered.T)
-            eigenvals, eigenvecs = np.linalg.eig(cov_matrix)
-            idx = np.argsort(eigenvals)[::-1]
-            main_direction = eigenvecs[:, idx[0]]  # 中轴线主方向
-            
-            # 将中轴线点投影到主方向上并排序
-            projections = np.dot(centerline_centered, main_direction)
-            sorted_indices = np.argsort(projections)
-            sorted_centerline = centerline_points[sorted_indices]
-            
-            # 生成曲面上的32x32网格点
-            surface_grid_points = self._generate_surface_grid(
-                sorted_centerline, main_direction, grid_size, point_spacing
-            )
-            
-            self.targets.append(surface_grid_points.astype(np.float32))
+            # 生成增强数据
+            augmented_trees = [td]
+            for _ in range(3):  # 生成3个增强版本
+                import copy
+                td_aug = copy.deepcopy(td)
+                td_aug["branches"] = apply_cascade_transform_to_branches(
+                    td_aug["branches"],
+                    max_offset=1.0,
+                    rotation_range=30.0,
+                    offset_strength=0.3,
+                    rotation_strength=0.3
+                )
+                augmented_trees.append(td_aug)
+            for td_aug in augmented_trees:
+                pts = tree_points_to_array(td_aug)
+                self.data.append(pts)
+                trunk_pts, br1_pts, br2_pts = find_max_points_branches(td_aug)
+                # 计算两个分支对应点的中点，构建中轴线
+                min_len = min(len(br1_pts), len(br2_pts))
+                if min_len > 0:
+                    # 取相同数量的点来计算中点
+                    br1_sampled = br1_pts[:min_len]
+                    br2_sampled = br2_pts[:min_len]
+                    midpoints = (br1_sampled + br2_sampled) / 2.0
+                else:
+                    # 如果没有分支点，使用主干末端作为中点
+                    midpoints = np.array([trunk_pts[-1]])
+                # 构建中轴线：主干点 + 分支中点
+                centerline_points = np.vstack([trunk_pts, midpoints])
+                # 对中轴线点进行排序，确保连续性
+                centerline_center = centerline_points.mean(axis=0)
+                centerline_centered = centerline_points - centerline_center
+                # 使用PCA找到中轴线的主方向
+                cov_matrix = np.cov(centerline_centered.T)
+                eigenvals, eigenvecs = np.linalg.eig(cov_matrix)
+                idx = np.argsort(eigenvals)[::-1]
+                main_direction = eigenvecs[:, idx[0]]  # 中轴线主方向
+                # 将中轴线点投影到主方向上并排序
+                projections = np.dot(centerline_centered, main_direction)
+                sorted_indices = np.argsort(projections)
+                sorted_centerline = centerline_points[sorted_indices]
+                # 生成曲面上的32x32网格点
+                surface_grid_points = self._generate_surface_grid(
+                    sorted_centerline, main_direction, grid_size, point_spacing
+                )
+                self.targets.append(surface_grid_points.astype(np.float32))
     
     def _generate_surface_grid(self, centerline_points, main_direction, grid_size, point_spacing):
         """
