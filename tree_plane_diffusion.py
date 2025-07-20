@@ -9,22 +9,38 @@ import pdb
 from visual import compute_tree_plane_normals, calculate_perpendicular_plane, find_max_points_branches, generate_noisy_normals
 from tree_plane_predictor import tree_points_to_array, PointEncoder
 from cascade_transform import apply_cascade_transform_to_branches
+import os
 # 创建临时dataset实例来生成曲面
 class TempDataset:
     def _generate_surface_grid(self, centerline_points, main_direction, grid_size, point_spacing):
-        # 与Dataset中相同的逻辑
+        """
+        在以centerline_points为中轴的曲面上生成网格点
+        
+        Args:
+            centerline_points: 中轴线上的点 (N, 3)
+            main_direction: 中轴线主方向
+            grid_size: 网格大小
+            point_spacing: 点间距
+        
+        Returns:
+            surface_points: 曲面上的网格点 (grid_size, grid_size, 3)
+        """
+        # 计算网格范围
         grid_extent = (grid_size - 1) * point_spacing / 2
         
+        # 沿中轴线生成等距位置
         axis_positions = []
         for i in range(grid_size):
-            t = i / (grid_size - 1)
+            t = i / (grid_size - 1)  # 0 到 1
             axis_pos = self._interpolate_on_centerline(centerline_points, t)
             axis_positions.append(axis_pos)
         
         axis_positions = np.array(axis_positions)
         surface_points = np.zeros((grid_size, grid_size, 3))
         
+        # 为每个轴位置构建垂直平面的坐标系
         for i, axis_pos in enumerate(axis_positions):
+            # 计算在该位置处中轴线的切线方向
             if i == 0:
                 tangent = axis_positions[1] - axis_positions[0]
             elif i == grid_size - 1:
@@ -34,6 +50,7 @@ class TempDataset:
             
             tangent = tangent / (np.linalg.norm(tangent) + 1e-8)
             
+            # 构建垂直于切线的两个正交基向量
             if abs(np.dot(tangent, np.array([1, 0, 0]))) < 0.9:
                 base_vector = np.array([1, 0, 0])
             else:
@@ -45,14 +62,22 @@ class TempDataset:
             v_axis = np.cross(tangent, u_axis)
             v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
             
+            # 🔄 绕切线向量旋转90度
             u_axis_rotated = v_axis      # 原来的v_axis成为新的u_axis
-            v_axis_rotated = -u_axis 
-
+            v_axis_rotated = -u_axis     # 原来的u_axis的负值成为新的v_axis
+            
+            # 在垂直平面上生成网格点
             for j in range(grid_size):
+                # 从 -grid_extent 到 +grid_extent 均匀分布
                 offset = (j / (grid_size - 1) - 0.5) * 2 * grid_extent
+                
+                # 使用旋转后的坐标系在垂直平面上的点
                 point_on_surface = axis_pos + offset * u_axis_rotated
+                
+                # 添加轻微的曲率变化，使其更像真实的血管曲面
                 curvature_factor = 0.1 * abs(offset) * np.sin(i * np.pi / grid_size)
                 point_on_surface += curvature_factor * v_axis_rotated
+                
                 surface_points[i, j] = point_on_surface
         
         return surface_points
@@ -99,6 +124,7 @@ def generate_plane_points(center, normal, plane_size=30.0, grid_size=32):
     # 计算平面上的点
     points = center + u[...,None]*v1 + v[...,None]*v2
     return points.reshape(-1, 3)  # (grid_size*grid_size, 3)
+
 
 # --------- Dataset ---------
 class TreeNormalDiffusionDataset(Dataset):
@@ -308,13 +334,33 @@ class CondNoisePredictor(nn.Module):
 # --------- Training function ---------
 
 def train_tree_diffusion(train_files: List[str], T:int=100, epochs:int=10000, batch_size:int=2, device='cpu', grid_size=32, point_spacing=0.2):
-    dataset = TreeNormalDiffusionDataset(train_files, grid_size=grid_size, point_spacing=point_spacing)
+    # 首先验证数据集
+    print("正在验证数据集...")
+    dataset = TreeNormalDiffusionDataset(train_files, grid_size, point_spacing)
+    _validate_dataset(dataset, device)
+    
     dl = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    model = CondNoisePredictor(grid_size=grid_size).to(device)
-    betas = linear_beta_schedule(T).to(device)
+    model = CondNoisePredictor(feat_dim=5, emb_dim=128, grid_size=grid_size).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-    for ep in range(1, epochs+1):
+    betas = linear_beta_schedule(T)
+    
+    # 可视化相关变量
+    viz_interval = 500  # 每500步可视化一次
+    viz_counter = 0
+    
+    # 训练监控变量
+    loss_history = []
+    noise_error_history = []
+    data_quality_metrics = []
+    
+    print(f"开始训练 - 数据集大小: {len(dataset)}, 批次大小: {batch_size}")
+    print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
+    
+    for ep in range(epochs):
         total=0;cnt=0
+        epoch_losses = []
+        epoch_noise_errors = []
+        
         for feats, clean in dl:
             feats, clean = feats.to(device), clean.to(device)
             B = clean.shape[0]
@@ -331,10 +377,431 @@ def train_tree_diffusion(train_files: List[str], T:int=100, epochs:int=10000, ba
             pred_noise = model(feats, noisy, t)
             loss = F.mse_loss(pred_noise, noise)
             opt.zero_grad(); loss.backward(); opt.step()
+            
+            # 记录损失和噪声预测误差
             total+=loss.item(); cnt+=1
+            epoch_losses.append(loss.item())
+            noise_error = F.mse_loss(pred_noise, noise).item()
+            epoch_noise_errors.append(noise_error)
+            
+            # 单步可视化策略
+            viz_counter += 1
+            if viz_counter % viz_interval == 0:
+                _visualize_training_step(feats, clean, noisy, pred_noise, noise, t, ep, viz_counter, device)
+                
+        # 记录epoch级别的统计信息
+        avg_loss = total/cnt
+        avg_noise_error = np.mean(epoch_noise_errors)
+        loss_history.append(avg_loss)
+        noise_error_history.append(avg_noise_error)
+        
+        # 计算数据质量指标
+        if ep % 10 == 0:  # 每10个epoch计算一次
+            quality_metrics = _calculate_data_quality_metrics(dataset, device)
+            data_quality_metrics.append(quality_metrics)
+        
         if ep%100==0:
-            print(f"Epoch {ep}/{epochs} loss {total/cnt:.6f}")
+            print(f"Epoch {ep}/{epochs} loss {avg_loss:.6f} noise_error {avg_noise_error:.6f}")
+            
+            # 绘制训练曲线
+            if len(loss_history) > 1:
+                _plot_training_curves(loss_history, noise_error_history, data_quality_metrics, ep)
+    
+    # 训练结束后的总结
+    print("\n=== 训练完成总结 ===")
+    print(f"最终损失: {loss_history[-1]:.6f}")
+    print(f"最终噪声预测误差: {noise_error_history[-1]:.6f}")
+    print(f"损失下降: {loss_history[0] - loss_history[-1]:.6f}")
+    
     return model, betas
+
+def _validate_dataset(dataset, device):
+    """
+    验证数据集的正确性
+    """
+    print("\n=== 数据集验证 ===")
+    
+    # 检查数据集大小
+    print(f"数据集大小: {len(dataset)}")
+    
+    # 检查几个样本
+    sample_indices = np.random.choice(len(dataset), min(3, len(dataset)), replace=False)
+    
+    for i, idx in enumerate(sample_indices):
+        print(f"\n样本 {i+1} (索引 {idx}):")
+        
+        feats, clean = dataset[idx]
+        
+        # 检查特征维度
+        print(f"  特征形状: {feats.shape}")
+        print(f"  目标形状: {clean.shape}")
+        
+        # 检查数值范围
+        feats_np = feats.numpy()
+        clean_np = clean.numpy()
+        
+        print(f"  特征范围: X[{feats_np[:, 0].min():.3f}, {feats_np[:, 0].max():.3f}], "
+              f"Y[{feats_np[:, 1].min():.3f}, {feats_np[:, 1].max():.3f}], "
+              f"Z[{feats_np[:, 2].min():.3f}, {feats_np[:, 2].max():.3f}]")
+        
+        grid_size = int(np.sqrt(clean.shape[0] // 3))
+        clean_reshaped = clean_np.reshape(grid_size, grid_size, 3)
+        print(f"  目标范围: X[{clean_reshaped[:, :, 0].min():.3f}, {clean_reshaped[:, :, 0].max():.3f}], "
+              f"Y[{clean_reshaped[:, :, 1].min():.3f}, {clean_reshaped[:, :, 1].max():.3f}], "
+              f"Z[{clean_reshaped[:, :, 2].min():.3f}, {clean_reshaped[:, :, 2].max():.3f}]")
+        
+        # 检查是否有NaN或无穷大值
+        if np.any(np.isnan(feats_np)) or np.any(np.isnan(clean_np)):
+            print("  ⚠️  警告: 发现NaN值!")
+        if np.any(np.isinf(feats_np)) or np.any(np.isinf(clean_np)):
+            print("  ⚠️  警告: 发现无穷大值!")
+        
+        # 检查曲面连续性
+        dx = np.gradient(clean_reshaped, axis=0)
+        dy = np.gradient(clean_reshaped, axis=1)
+        grad_magnitude = np.sqrt(np.sum(dx**2, axis=2) + np.sum(dy**2, axis=2))
+        max_grad = np.max(grad_magnitude)
+        print(f"  最大梯度: {max_grad:.3f}")
+        
+        if max_grad > 10.0:
+            print("  ⚠️  警告: 曲面梯度过大，可能存在不连续")
+    
+    # 可视化第一个样本
+    print("\n正在生成验证可视化...")
+    feats, clean = dataset[0]
+    feats = feats.unsqueeze(0).to(device)
+    clean = clean.unsqueeze(0).to(device)
+    
+    _visualize_validation_sample(feats, clean, device)
+    
+    print("✅ 数据集验证完成")
+
+def _visualize_validation_sample(feats, clean, device):
+    """
+    可视化验证样本
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    # 提取数据
+    feats_np = feats[0].cpu().numpy()
+    original_points = feats_np[:, :3]
+    
+    grid_size = int(np.sqrt(clean.shape[1] // 3))
+    clean_np = clean[0].cpu().numpy().reshape(grid_size, grid_size, 3)
+    
+    # 创建可视化
+    fig = plt.figure(figsize=(15, 5))
+    fig.suptitle('数据集验证可视化', fontsize=16)
+    
+    # 原始点云
+    ax1 = fig.add_subplot(1, 3, 1, projection='3d')
+    ax1.scatter(original_points[:, 0], original_points[:, 1], original_points[:, 2], 
+               c='blue', s=1, alpha=0.6)
+    ax1.set_title('原始血管点云')
+    ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
+    
+    # 目标曲面
+    ax2 = fig.add_subplot(1, 3, 2, projection='3d')
+    ax2.plot_surface(clean_np[:, :, 0], clean_np[:, :, 1], clean_np[:, :, 2], 
+                    alpha=0.7, cmap='viridis')
+    ax2.set_title('目标曲面')
+    ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')
+    
+    # 点云与曲面对比
+    ax3 = fig.add_subplot(1, 3, 3, projection='3d')
+    ax3.scatter(original_points[:, 0], original_points[:, 1], original_points[:, 2], 
+               c='blue', s=1, alpha=0.6, label='原始点云')
+    ax3.plot_surface(clean_np[:, :, 0], clean_np[:, :, 1], clean_np[:, :, 2], 
+                    alpha=0.3, cmap='viridis', label='目标曲面')
+    ax3.set_title('点云与曲面对比')
+    ax3.set_xlabel('X'); ax3.set_ylabel('Y'); ax3.set_zlabel('Z')
+    ax3.legend()
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    save_dir = "training_visualization"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "dataset_validation.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"验证可视化已保存: {save_path}")
+
+def _calculate_data_quality_metrics(dataset, device):
+    """
+    计算数据集质量指标
+    """
+    metrics = {}
+    
+    # 随机采样几个样本进行分析
+    sample_indices = np.random.choice(len(dataset), min(5, len(dataset)), replace=False)
+    
+    surface_areas = []
+    surface_smoothness = []
+    point_cloud_coverage = []
+    
+    for idx in sample_indices:
+        feats, clean = dataset[idx]
+        feats = feats.unsqueeze(0).to(device)
+        clean = clean.unsqueeze(0).to(device)
+        
+        # 计算曲面面积
+        grid_size = int(np.sqrt(clean.shape[1] // 3))
+        clean_reshaped = clean[0].cpu().numpy().reshape(grid_size, grid_size, 3)
+        
+        # 计算曲面面积（简化版本）
+        dx = np.gradient(clean_reshaped, axis=0)
+        dy = np.gradient(clean_reshaped, axis=1)
+        area_elements = np.sqrt(np.sum(dx**2, axis=2) + np.sum(dy**2, axis=2))
+        surface_area = np.sum(area_elements)
+        surface_areas.append(surface_area)
+        
+        # 计算曲面平滑度
+        laplacian = np.gradient(np.gradient(clean_reshaped, axis=0), axis=0) + \
+                   np.gradient(np.gradient(clean_reshaped, axis=1), axis=1)
+        smoothness = np.mean(np.linalg.norm(laplacian, axis=2))
+        surface_smoothness.append(smoothness)
+        
+        # 计算点云覆盖度
+        original_points = feats[0, :, :3].cpu().numpy()
+        surface_center = np.mean(clean_reshaped, axis=(0, 1))
+        distances = np.linalg.norm(original_points - surface_center, axis=1)
+        coverage = np.mean(distances < np.std(distances) * 2)
+        point_cloud_coverage.append(coverage)
+    
+    metrics['avg_surface_area'] = np.mean(surface_areas)
+    metrics['avg_smoothness'] = np.mean(surface_smoothness)
+    metrics['avg_coverage'] = np.mean(point_cloud_coverage)
+    
+    return metrics
+
+def _plot_training_curves(loss_history, noise_error_history, data_quality_metrics, current_epoch):
+    """
+    绘制训练曲线
+    """
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle(f'训练监控 - Epoch {current_epoch}', fontsize=16)
+    
+    # 损失曲线
+    axes[0, 0].plot(loss_history, 'b-', label='总损失')
+    axes[0, 0].set_title('训练损失')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+    
+    # 噪声预测误差
+    axes[0, 1].plot(noise_error_history, 'r-', label='噪声预测误差')
+    axes[0, 1].set_title('噪声预测误差')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('MSE')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+    
+    # 数据质量指标
+    if data_quality_metrics:
+        epochs_quality = list(range(0, len(data_quality_metrics) * 10, 10))
+        surface_areas = [m['avg_surface_area'] for m in data_quality_metrics]
+        smoothness = [m['avg_smoothness'] for m in data_quality_metrics]
+        
+        axes[1, 0].plot(epochs_quality, surface_areas, 'g-', label='平均曲面面积')
+        axes[1, 0].set_title('数据质量 - 曲面面积')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('面积')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True)
+        
+        axes[1, 1].plot(epochs_quality, smoothness, 'm-', label='平均平滑度')
+        axes[1, 1].set_title('数据质量 - 曲面平滑度')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('平滑度')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True)
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    save_dir = "training_visualization"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"training_curves_{current_epoch}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"训练曲线已保存: {save_path}")
+
+def _visualize_training_step(feats, clean, noisy, pred_noise, true_noise, t, epoch, step, device):
+    """
+    可视化训练过程中的单步数据，用于监测训练正确性
+    
+    Args:
+        feats: 输入特征 (B, N, F)
+        clean: 干净的目标曲面 (B, grid_size*grid_size*3)
+        noisy: 加噪声的曲面 (B, grid_size*grid_size*3)
+        pred_noise: 预测的噪声 (B, grid_size*grid_size*3)
+        true_noise: 真实的噪声 (B, grid_size*grid_size*3)
+        t: 时间步 (B,)
+        epoch: 当前epoch
+        step: 当前步数
+        device: 设备
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    # 只可视化第一个样本
+    batch_idx = 0
+    grid_size = int(np.sqrt(clean.shape[1] // 3))
+    
+    # 将张量转换为numpy数组并重塑
+    clean_np = clean[batch_idx].cpu().detach().numpy().reshape(grid_size, grid_size, 3)
+    noisy_np = noisy[batch_idx].cpu().detach().numpy().reshape(grid_size, grid_size, 3)
+    pred_noise_np = pred_noise[batch_idx].cpu().detach().numpy().reshape(grid_size, grid_size, 3)
+    true_noise_np = true_noise[batch_idx].cpu().detach().numpy().reshape(grid_size, grid_size, 3)
+    
+    # 提取原始点云数据
+    feats_np = feats[batch_idx].cpu().detach().numpy()
+    original_points = feats_np[:, :3]  # 只取xyz坐标
+    
+    # 创建子图
+    fig = plt.figure(figsize=(20, 12))
+    fig.suptitle(f'训练步骤可视化 - Epoch {epoch}, Step {step}, Time Step {t[batch_idx].item()}', fontsize=16)
+    
+    # 1. 原始点云
+    ax1 = fig.add_subplot(2, 3, 1, projection='3d')
+    ax1.scatter(original_points[:, 0], original_points[:, 1], original_points[:, 2], 
+               c='blue', s=1, alpha=0.6, label='原始点云')
+    ax1.set_title('原始血管点云')
+    ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
+    ax1.legend()
+    
+    # 2. 目标曲面 (clean)
+    ax2 = fig.add_subplot(2, 3, 2, projection='3d')
+    ax2.plot_surface(clean_np[:, :, 0], clean_np[:, :, 1], clean_np[:, :, 2], 
+                    alpha=0.7, cmap='viridis')
+    ax2.set_title('目标曲面 (Label)')
+    ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')
+    
+    # 3. 加噪声的曲面
+    ax3 = fig.add_subplot(2, 3, 3, projection='3d')
+    ax3.plot_surface(noisy_np[:, :, 0], noisy_np[:, :, 1], noisy_np[:, :, 2], 
+                    alpha=0.7, cmap='plasma')
+    ax3.set_title('加噪声曲面 (Input)')
+    ax3.set_xlabel('X'); ax3.set_ylabel('Y'); ax3.set_zlabel('Z')
+    
+    # 4. 真实噪声
+    ax4 = fig.add_subplot(2, 3, 4, projection='3d')
+    ax4.plot_surface(true_noise_np[:, :, 0], true_noise_np[:, :, 1], true_noise_np[:, :, 2], 
+                    alpha=0.7, cmap='coolwarm')
+    ax4.set_title('真实噪声 (Ground Truth)')
+    ax4.set_xlabel('X'); ax4.set_ylabel('Y'); ax4.set_zlabel('Z')
+    
+    # 5. 预测噪声
+    ax5 = fig.add_subplot(2, 3, 5, projection='3d')
+    ax5.plot_surface(pred_noise_np[:, :, 0], pred_noise_np[:, :, 1], pred_noise_np[:, :, 2], 
+                    alpha=0.7, cmap='coolwarm')
+    ax5.set_title('预测噪声 (Prediction)')
+    ax5.set_xlabel('X'); ax5.set_ylabel('Y'); ax5.set_zlabel('Z')
+    
+    # 6. 噪声差异 (预测 - 真实)
+    noise_diff = pred_noise_np - true_noise_np
+    ax6 = fig.add_subplot(2, 3, 6, projection='3d')
+    im = ax6.plot_surface(noise_diff[:, :, 0], noise_diff[:, :, 1], noise_diff[:, :, 2], 
+                         alpha=0.7, cmap='RdBu')
+    ax6.set_title('噪声预测误差')
+    ax6.set_xlabel('X'); ax6.set_ylabel('Y'); ax6.set_zlabel('Z')
+    
+    # 添加颜色条
+    fig.colorbar(im, ax=ax6, shrink=0.5, aspect=5)
+    
+    # 计算和显示统计信息
+    noise_mse = np.mean((pred_noise_np - true_noise_np) ** 2)
+    noise_mae = np.mean(np.abs(pred_noise_np - true_noise_np))
+    
+    # 在图上添加统计信息
+    stats_text = f'噪声MSE: {noise_mse:.6f}\n噪声MAE: {noise_mae:.6f}'
+    fig.text(0.02, 0.02, stats_text, fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    save_dir = "training_visualization"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"training_step_{epoch}_{step}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    
+    print(f"训练可视化已保存: {save_path}")
+    print(f"噪声预测误差 - MSE: {noise_mse:.6f}, MAE: {noise_mae:.6f}")
+    
+    # 检查数据合理性
+    _check_training_data_validity(clean_np, noisy_np, pred_noise_np, true_noise_np, original_points)
+    
+    plt.close()
+
+def _check_training_data_validity(clean, noisy, pred_noise, true_noise, original_points):
+    """
+    检查训练数据的合理性
+    
+    Args:
+        clean: 目标曲面
+        noisy: 加噪声曲面
+        pred_noise: 预测噪声
+        true_noise: 真实噪声
+        original_points: 原始点云
+    """
+    print("\n=== 训练数据合理性检查 ===")
+    
+    # 1. 检查曲面形状
+    clean_range = np.ptp(clean, axis=(0, 1))  # 每个维度的范围
+    noisy_range = np.ptp(noisy, axis=(0, 1))
+    print(f"目标曲面范围: X[{clean_range[0]:.3f}], Y[{clean_range[1]:.3f}], Z[{clean_range[2]:.3f}]")
+    print(f"噪声曲面范围: X[{noisy_range[0]:.3f}], Y[{noisy_range[1]:.3f}], Z[{noisy_range[2]:.3f}]")
+    
+    # 2. 检查噪声幅度
+    noise_magnitude = np.linalg.norm(true_noise, axis=2)
+    pred_magnitude = np.linalg.norm(pred_noise, axis=2)
+    print(f"真实噪声幅度: 均值={np.mean(noise_magnitude):.3f}, 标准差={np.std(noise_magnitude):.3f}")
+    print(f"预测噪声幅度: 均值={np.mean(pred_magnitude):.3f}, 标准差={np.std(pred_magnitude):.3f}")
+    
+    # 3. 检查点云与曲面的关系
+    original_center = np.mean(original_points, axis=0)
+    surface_center = np.mean(clean, axis=(0, 1))
+    distance = np.linalg.norm(original_center - surface_center)
+    print(f"原始点云中心与曲面中心距离: {distance:.3f}")
+    
+    # 4. 检查曲面连续性
+    clean_grad_x = np.gradient(clean, axis=0)
+    clean_grad_y = np.gradient(clean, axis=1)
+    grad_magnitude = np.sqrt(np.sum(clean_grad_x**2 + clean_grad_y**2, axis=2))
+    print(f"曲面梯度幅度: 均值={np.mean(grad_magnitude):.3f}, 最大值={np.max(grad_magnitude):.3f}")
+    
+    # 5. 检查是否有异常值
+    clean_std = np.std(clean, axis=(0, 1))
+    noisy_std = np.std(noisy, axis=(0, 1))
+    print(f"目标曲面标准差: X[{clean_std[0]:.3f}], Y[{clean_std[1]:.3f}], Z[{clean_std[2]:.3f}]")
+    print(f"噪声曲面标准差: X[{noisy_std[0]:.3f}], Y[{noisy_std[1]:.3f}], Z[{noisy_std[2]:.3f}]")
+    
+    # 6. 合理性判断
+    issues = []
+    if distance > 5.0:
+        issues.append("原始点云与曲面中心距离过大")
+    if np.max(grad_magnitude) > 10.0:
+        issues.append("曲面梯度过大，可能存在不连续")
+    if np.any(clean_std > 5.0):
+        issues.append("目标曲面标准差过大")
+    if np.mean(noise_magnitude) > 2.0:
+        issues.append("噪声幅度过大")
+    
+    if issues:
+        print("⚠️  发现潜在问题:")
+        for issue in issues:
+            print(f"  - {issue}")
+    else:
+        print("✅ 数据看起来合理")
+    
+    print("=" * 40)
 
 # --------- Denoise ---------
 
@@ -1358,8 +1825,8 @@ def quick_demo_interactive_visualization(tree_json: str):
     try:
         # 1. 展示最优初始平面
         print("\n1. 最优初始平面分析")
-        visualize_optimal_plane(tree_json, grid_size=16, point_spacing=0.3, 
-                               save_path=None, interactive=True)
+        # visualize_optimal_plane(tree_json, grid_size=16, point_spacing=0.3, 
+        #                        save_path=None, interactive=True)
         
         # 2. 展示训练目标曲面  
         print("\n2. 训练目标曲面")
@@ -1586,8 +2053,8 @@ if __name__=='__main__':
         point_spacing = 0.2  # 可调节的点间距
         
         print("=== 可视化最优初始平面 ===")
-        visualize_optimal_plane(files[0], grid_size=grid_size, point_spacing=point_spacing, 
-                               save_path="optimal_plane_visualization.png", interactive=True)
+        # visualize_optimal_plane(files[0], grid_size=grid_size, point_spacing=point_spacing, 
+        #                        save_path="optimal_plane_visualization.png", interactive=True)
         
         print("\n=== 可视化训练目标曲面 ===")
         target_surface, centerline = visualize_training_target_surface(
@@ -1788,3 +2255,649 @@ def visualize_separation_effect(tree_json: str, separation_surface: np.ndarray, 
 
 print("测试merge")
 print("ceshi2")
+
+# --------- SVM曲面切分 ---------
+def create_svm_separation_surface(points_group1, points_group2, grid_size=32, plane_size=10.0, kernel='rbf', C=1.0):
+    """
+    使用SVM创建一个曲面来区分两组3D点
+    
+    Args:
+        points_group1: 第一组点 (N1, 3)
+        points_group2: 第二组点 (N2, 3)
+        grid_size: 生成的曲面网格大小
+        plane_size: 曲面的大小范围
+        kernel: SVM核函数 ('linear', 'rbf', 'poly')
+        C: SVM正则化参数
+    
+    Returns:
+        separation_surface: 分离曲面 (grid_size, grid_size, 3)
+        svm_model: 训练好的SVM模型
+        separation_info: 分离信息字典
+    """
+    from sklearn.svm import SVC
+    from sklearn.preprocessing import StandardScaler
+    import numpy as np
+    
+    # 准备训练数据
+    X = np.vstack([points_group1, points_group2])
+    y = np.hstack([np.ones(len(points_group1)), -np.ones(len(points_group2))])
+    
+    # 标准化特征
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # 训练SVM模型
+    svm_model = SVC(kernel=kernel, C=C, probability=True)
+    svm_model.fit(X_scaled, y)
+    
+    # 计算分离超平面的法向量和偏移
+    if kernel == 'linear':
+        # 线性核可以直接获取法向量
+        normal_vector = svm_model.coef_[0]
+        bias = svm_model.intercept_[0]
+    else:
+        # 非线性核需要近似法向量
+        normal_vector, bias = _approximate_svm_normal(svm_model, X_scaled, y)
+    
+    # 计算两组点的中心
+    center_group1 = np.mean(points_group1, axis=0)
+    center_group2 = np.mean(points_group2, axis=0)
+    center = (center_group1 + center_group2) / 2
+    
+    # 生成分离曲面
+    separation_surface = _generate_separation_surface(
+        center, normal_vector, bias, scaler, svm_model, 
+        grid_size, plane_size, kernel
+    )
+    
+    # 计算分离效果
+    separation_info = _evaluate_separation_quality(
+        points_group1, points_group2, separation_surface, svm_model, scaler
+    )
+    
+    return separation_surface, svm_model, separation_info
+
+def _approximate_svm_normal(svm_model, X_scaled, y):
+    """
+    近似计算非线性SVM的法向量
+    """
+    # 使用支持向量来近似法向量
+    support_vectors = svm_model.support_vectors_
+    support_vector_coefs = svm_model.dual_coef_[0]
+    
+    # 计算加权支持向量的平均方向
+    weighted_sv = np.sum(support_vectors * support_vector_coefs[:, np.newaxis], axis=0)
+    normal_vector = weighted_sv / (np.linalg.norm(weighted_sv) + 1e-8)
+    
+    # 计算偏移
+    bias = svm_model.intercept_[0]
+    
+    return normal_vector, bias
+
+def _generate_separation_surface(center, normal_vector, bias, scaler, svm_model, grid_size, plane_size, kernel):
+    """
+    生成分离曲面
+    """
+    # 构建垂直于法向量的两个基向量
+    if abs(np.dot(normal_vector, np.array([1, 0, 0]))) < 0.9:
+        base_vector = np.array([1, 0, 0])
+    else:
+        base_vector = np.array([0, 1, 0])
+    
+    u_axis = np.cross(normal_vector, base_vector)
+    u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
+    
+    v_axis = np.cross(normal_vector, u_axis)
+    v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
+    
+    # 生成网格
+    g = np.linspace(-plane_size/2, plane_size/2, grid_size)
+    u, v = np.meshgrid(g, g)
+    
+    # 初始化曲面
+    surface = np.zeros((grid_size, grid_size, 3))
+    
+    for i in range(grid_size):
+        for j in range(grid_size):
+            # 基础平面点
+            base_point = center + u[i, j] * u_axis + v[i, j] * v_axis
+            
+            if kernel == 'linear':
+                # 线性核：直接使用超平面
+                # 计算到超平面的距离
+                distance = np.dot(base_point, normal_vector) + bias
+                # 将点投影到超平面上
+                surface[i, j] = base_point - distance * normal_vector
+            else:
+                # 非线性核：使用SVM决策函数
+                surface[i, j] = _find_decision_boundary_point(
+                    base_point, normal_vector, svm_model, scaler, grid_size
+                )
+    
+    return surface
+
+def _find_decision_boundary_point(base_point, normal_vector, svm_model, scaler, max_iter=10):
+    """
+    找到决策边界上的点
+    """
+    current_point = base_point.copy()
+    
+    for _ in range(max_iter):
+        # 标准化当前点
+        current_point_scaled = scaler.transform(current_point.reshape(1, -1))
+        
+        # 计算决策函数值
+        decision_value = svm_model.decision_function(current_point_scaled)[0]
+        
+        # 如果接近决策边界，停止迭代
+        if abs(decision_value) < 1e-3:
+            break
+        
+        # 沿法向量方向调整点
+        adjustment = decision_value * normal_vector * 0.1
+        current_point -= adjustment
+    
+    return current_point
+
+def _evaluate_separation_quality(points_group1, points_group2, separation_surface, svm_model, scaler):
+    """
+    评估分离质量
+    """
+    # 计算分离准确率
+    X = np.vstack([points_group1, points_group2])
+    y_true = np.hstack([np.ones(len(points_group1)), -np.ones(len(points_group2))])
+    
+    X_scaled = scaler.transform(X)
+    y_pred = svm_model.predict(X_scaled)
+    
+    accuracy = np.mean(y_pred == y_true)
+    
+    # 计算两组点到曲面的平均距离
+    surface_center = np.mean(separation_surface, axis=(0, 1))
+    
+    distances_group1 = []
+    distances_group2 = []
+    
+    for point in points_group1:
+        # 找到曲面上最近的点
+        distances = np.linalg.norm(separation_surface.reshape(-1, 3) - point, axis=1)
+        min_distance = np.min(distances)
+        distances_group1.append(min_distance)
+    
+    for point in points_group2:
+        distances = np.linalg.norm(separation_surface.reshape(-1, 3) - point, axis=1)
+        min_distance = np.min(distances)
+        distances_group2.append(min_distance)
+    
+    avg_distance_group1 = np.mean(distances_group1)
+    avg_distance_group2 = np.mean(distances_group2)
+    
+    # 计算分离度（两组点距离的差异）
+    separation_degree = abs(avg_distance_group1 - avg_distance_group2)
+    
+    return {
+        'accuracy': accuracy,
+        'avg_distance_group1': avg_distance_group1,
+        'avg_distance_group2': avg_distance_group2,
+        'separation_degree': separation_degree,
+        'support_vectors_count': len(svm_model.support_vectors_)
+    }
+
+def visualize_svm_separation(points_group1, points_group2, separation_surface, separation_info, 
+                           save_path=None, interactive=True):
+    """
+    可视化SVM分离结果
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    fig = plt.figure(figsize=(15, 10))
+    fig.suptitle('SVM曲面分离可视化', fontsize=16)
+    
+    # 主视图：点云和分离曲面
+    ax1 = fig.add_subplot(2, 3, 1, projection='3d')
+    ax1.scatter(points_group1[:, 0], points_group1[:, 1], points_group1[:, 2], 
+               c='red', s=20, alpha=0.7, label='组1')
+    ax1.scatter(points_group2[:, 0], points_group2[:, 1], points_group2[:, 2], 
+               c='blue', s=20, alpha=0.7, label='组2')
+    ax1.plot_surface(separation_surface[:, :, 0], separation_surface[:, :, 1], separation_surface[:, :, 2], 
+                    alpha=0.3, color='green', label='分离曲面')
+    ax1.set_title('SVM分离结果')
+    ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
+    ax1.legend()
+    
+    # 分离曲面细节
+    ax2 = fig.add_subplot(2, 3, 2, projection='3d')
+    ax2.plot_surface(separation_surface[:, :, 0], separation_surface[:, :, 1], separation_surface[:, :, 2], 
+                    alpha=0.8, cmap='viridis')
+    ax2.set_title('分离曲面')
+    ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')
+    
+    # 距离分布
+    ax3 = fig.add_subplot(2, 3, 3)
+    distances_group1 = []
+    distances_group2 = []
+    
+    for point in points_group1:
+        distances = np.linalg.norm(separation_surface.reshape(-1, 3) - point, axis=1)
+        distances_group1.append(np.min(distances))
+    
+    for point in points_group2:
+        distances = np.linalg.norm(separation_surface.reshape(-1, 3) - point, axis=1)
+        distances_group2.append(np.min(distances))
+    
+    ax3.hist(distances_group1, bins=20, alpha=0.7, label='组1距离', color='red')
+    ax3.hist(distances_group2, bins=20, alpha=0.7, label='组2距离', color='blue')
+    ax3.set_title('到分离曲面的距离分布')
+    ax3.set_xlabel('距离'); ax3.set_ylabel('频次')
+    ax3.legend()
+    
+    # 统计信息
+    ax4 = fig.add_subplot(2, 3, 4)
+    ax4.axis('off')
+    stats_text = f"""
+    分离质量统计:
+    
+    准确率: {separation_info['accuracy']:.3f}
+    组1平均距离: {separation_info['avg_distance_group1']:.3f}
+    组2平均距离: {separation_info['avg_distance_group2']:.3f}
+    分离度: {separation_info['separation_degree']:.3f}
+    支持向量数量: {separation_info['support_vectors_count']}
+    """
+    ax4.text(0.1, 0.5, stats_text, fontsize=12, verticalalignment='center',
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+    
+    # 投影视图
+    ax5 = fig.add_subplot(2, 3, 5)
+    ax5.scatter(points_group1[:, 0], points_group1[:, 1], c='red', s=20, alpha=0.7, label='组1')
+    ax5.scatter(points_group2[:, 0], points_group2[:, 1], c='blue', s=20, alpha=0.7, label='组2')
+    ax5.set_title('XY平面投影')
+    ax5.set_xlabel('X'); ax5.set_ylabel('Y')
+    ax5.legend()
+    
+    # 3D投影
+    ax6 = fig.add_subplot(2, 3, 6, projection='3d')
+    ax6.scatter(points_group1[:, 0], points_group1[:, 1], points_group1[:, 2], 
+               c='red', s=20, alpha=0.7, label='组1')
+    ax6.scatter(points_group2[:, 0], points_group2[:, 1], points_group2[:, 2], 
+               c='blue', s=20, alpha=0.7, label='组2')
+    ax6.set_title('3D点云分布')
+    ax6.set_xlabel('X'); ax6.set_ylabel('Y'); ax6.set_zlabel('Z')
+    ax6.legend()
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"SVM分离可视化已保存: {save_path}")
+    
+    if interactive:
+        plt.show()
+    else:
+        plt.close()
+
+# --------- 其他分离方法 ---------
+def create_lda_separation_surface(points_group1, points_group2, grid_size=32, plane_size=10.0):
+    """
+    使用线性判别分析(LDA)创建分离曲面
+    """
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+    import numpy as np
+    
+    # 准备数据
+    X = np.vstack([points_group1, points_group2])
+    y = np.hstack([np.ones(len(points_group1)), np.zeros(len(points_group2))])
+    
+    # 训练LDA
+    lda = LinearDiscriminantAnalysis()
+    lda.fit(X, y)
+    
+    # 获取分离超平面
+    normal_vector = lda.coef_[0]
+    bias = lda.intercept_[0]
+    
+    # 生成分离曲面
+    center = (np.mean(points_group1, axis=0) + np.mean(points_group2, axis=0)) / 2
+    separation_surface = _generate_lda_surface(center, normal_vector, bias, grid_size, plane_size)
+    
+    return separation_surface, lda
+
+def create_kmeans_separation_surface(points_group1, points_group2, grid_size=32, plane_size=10.0):
+    """
+    使用K-means聚类创建分离曲面
+    """
+    from sklearn.cluster import KMeans
+    import numpy as np
+    
+    # 合并所有点
+    all_points = np.vstack([points_group1, points_group2])
+    
+    # 使用K-means聚类
+    kmeans = KMeans(n_clusters=2, random_state=42)
+    kmeans.fit(all_points)
+    
+    # 获取聚类中心
+    centers = kmeans.cluster_centers_
+    
+    # 计算分离超平面
+    normal_vector = centers[1] - centers[0]
+    normal_vector = normal_vector / np.linalg.norm(normal_vector)
+    bias = -np.dot(normal_vector, (centers[0] + centers[1]) / 2)
+    
+    # 生成分离曲面
+    center = (centers[0] + centers[1]) / 2
+    separation_surface = _generate_lda_surface(center, normal_vector, bias, grid_size, plane_size)
+    
+    return separation_surface, kmeans
+
+def _generate_lda_surface(center, normal_vector, bias, grid_size, plane_size):
+    """
+    生成LDA分离曲面
+    """
+    # 构建垂直于法向量的两个基向量
+    if abs(np.dot(normal_vector, np.array([1, 0, 0]))) < 0.9:
+        base_vector = np.array([1, 0, 0])
+    else:
+        base_vector = np.array([0, 1, 0])
+    
+    u_axis = np.cross(normal_vector, base_vector)
+    u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-8)
+    
+    v_axis = np.cross(normal_vector, u_axis)
+    v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-8)
+    
+    # 生成网格
+    g = np.linspace(-plane_size/2, plane_size/2, grid_size)
+    u, v = np.meshgrid(g, g)
+    
+    # 生成曲面
+    surface = np.zeros((grid_size, grid_size, 3))
+    
+    for i in range(grid_size):
+        for j in range(grid_size):
+            base_point = center + u[i, j] * u_axis + v[i, j] * v_axis
+            distance = np.dot(base_point, normal_vector) + bias
+            surface[i, j] = base_point - distance * normal_vector
+    
+    return surface
+
+def demo_separation_methods():
+    """
+    演示不同分离方法的效果
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    print("=== 曲面分离方法演示 ===")
+    
+    # 生成两组分离的点云数据
+    np.random.seed(42)
+    
+    # 组1：球形分布
+    n1 = 200
+    r1 = 2.0
+    theta1 = np.random.uniform(0, 2*np.pi, n1)
+    phi1 = np.random.uniform(0, np.pi, n1)
+    x1 = r1 * np.sin(phi1) * np.cos(theta1) + np.random.normal(0, 0.3, n1)
+    y1 = r1 * np.sin(phi1) * np.sin(theta1) + np.random.normal(0, 0.3, n1)
+    z1 = r1 * np.cos(phi1) + np.random.normal(0, 0.3, n1)
+    points_group1 = np.column_stack([x1, y1, z1])
+    
+    # 组2：椭球形分布
+    n2 = 200
+    r2 = 3.0
+    theta2 = np.random.uniform(0, 2*np.pi, n2)
+    phi2 = np.random.uniform(0, np.pi, n2)
+    x2 = r2 * np.sin(phi2) * np.cos(theta2) + np.random.normal(0, 0.3, n2)
+    y2 = r2 * np.sin(phi2) * np.sin(theta2) + np.random.normal(0, 0.3, n2)
+    z2 = r2 * np.cos(phi2) + np.random.normal(0, 0.3, n2)
+    points_group2 = np.column_stack([x2, y2, z2])
+    
+    # 将组2移动到不同位置
+    points_group2 += np.array([4, 2, 1])
+    
+    print(f"生成数据: 组1 {len(points_group1)}个点, 组2 {len(points_group2)}个点")
+    
+    # 测试不同的分离方法
+    methods = {
+        'SVM (Linear)': lambda: create_svm_separation_surface(
+            points_group1, points_group2, kernel='linear', C=1.0
+        ),
+        'SVM (RBF)': lambda: create_svm_separation_surface(
+            points_group1, points_group2, kernel='rbf', C=1.0
+        ),
+        'SVM (Poly)': lambda: create_svm_separation_surface(
+            points_group1, points_group2, kernel='poly', C=1.0
+        ),
+        'LDA': lambda: create_lda_separation_surface(points_group1, points_group2),
+        'K-means': lambda: create_kmeans_separation_surface(points_group1, points_group2)
+    }
+    
+    results = {}
+    
+    for method_name, method_func in methods.items():
+        print(f"\n正在测试 {method_name}...")
+        try:
+            if 'SVM' in method_name:
+                surface, model, info = method_func()
+                results[method_name] = {
+                    'surface': surface,
+                    'model': model,
+                    'info': info,
+                    'type': 'svm'
+                }
+                print(f"  - 准确率: {info['accuracy']:.3f}")
+                print(f"  - 分离度: {info['separation_degree']:.3f}")
+                print(f"  - 支持向量数: {info['support_vectors_count']}")
+            else:
+                surface, model = method_func()
+                results[method_name] = {
+                    'surface': surface,
+                    'model': model,
+                    'type': 'other'
+                }
+                print(f"  - 完成")
+        except Exception as e:
+            print(f"  - 错误: {e}")
+            results[method_name] = None
+    
+    # 可视化所有方法的结果
+    _visualize_all_separation_methods(points_group1, points_group2, results)
+    
+    return results
+
+def _visualize_all_separation_methods(points_group1, points_group2, results):
+    """
+    可视化所有分离方法的结果对比
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    # 计算子图布局
+    n_methods = len([r for r in results.values() if r is not None])
+    n_cols = 3
+    n_rows = (n_methods + n_cols - 1) // n_cols
+    
+    fig = plt.figure(figsize=(15, 5 * n_rows))
+    fig.suptitle('不同分离方法效果对比', fontsize=16)
+    
+    plot_idx = 1
+    
+    for method_name, result in results.items():
+        if result is None:
+            continue
+            
+        ax = fig.add_subplot(n_rows, n_cols, plot_idx, projection='3d')
+        
+        # 绘制原始点云
+        ax.scatter(points_group1[:, 0], points_group1[:, 1], points_group1[:, 2], 
+                  c='red', s=20, alpha=0.7, label='组1')
+        ax.scatter(points_group2[:, 0], points_group2[:, 1], points_group2[:, 2], 
+                  c='blue', s=20, alpha=0.7, label='组2')
+        
+        # 绘制分离曲面
+        surface = result['surface']
+        ax.plot_surface(surface[:, :, 0], surface[:, :, 1], surface[:, :, 2], 
+                       alpha=0.3, color='green')
+        
+        ax.set_title(f'{method_name}')
+        ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+        
+        # 添加统计信息
+        if result['type'] == 'svm':
+            info = result['info']
+            stats_text = f"准确率: {info['accuracy']:.3f}\n分离度: {info['separation_degree']:.3f}"
+            ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                     verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+        
+        plot_idx += 1
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    save_dir = "separation_visualization"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "separation_methods_comparison.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\n分离方法对比图已保存: {save_path}")
+    
+    # 打印总结
+    print("\n=== 分离方法总结 ===")
+    for method_name, result in results.items():
+        if result is not None and result['type'] == 'svm':
+            info = result['info']
+            print(f"{method_name}:")
+            print(f"  - 准确率: {info['accuracy']:.3f}")
+            print(f"  - 分离度: {info['separation_degree']:.3f}")
+            print(f"  - 支持向量数: {info['support_vectors_count']}")
+            print()
+
+def compare_separation_methods_for_vascular_data(tree_json: str):
+    """
+    针对血管数据比较不同分离方法
+    """
+    print("=== 血管数据分离方法比较 ===")
+    
+    # 加载血管数据
+    with open(tree_json, 'r') as fp:
+        tree_data = json.load(fp)
+    
+    # 提取主干和分支点
+    trunk_pts, br1_pts, br2_pts = find_max_points_branches(tree_data)
+    
+    print(f"主干点: {len(trunk_pts)}")
+    print(f"分支1点: {len(br1_pts)}")
+    print(f"分支2点: {len(br2_pts)}")
+    
+    # 比较不同方法分离主干和分支
+    methods = {
+        'SVM (Linear)': lambda: create_svm_separation_surface(
+            trunk_pts, np.vstack([br1_pts, br2_pts]), kernel='linear', C=1.0
+        ),
+        'SVM (RBF)': lambda: create_svm_separation_surface(
+            trunk_pts, np.vstack([br1_pts, br2_pts]), kernel='rbf', C=1.0
+        ),
+        'LDA': lambda: create_lda_separation_surface(
+            trunk_pts, np.vstack([br1_pts, br2_pts])
+        ),
+        'K-means': lambda: create_kmeans_separation_surface(
+            trunk_pts, np.vstack([br1_pts, br2_pts])
+        )
+    }
+    
+    results = {}
+    
+    for method_name, method_func in methods.items():
+        print(f"\n正在测试 {method_name}...")
+        try:
+            if 'SVM' in method_name:
+                surface, model, info = method_func()
+                results[method_name] = {
+                    'surface': surface,
+                    'model': model,
+                    'info': info,
+                    'type': 'svm'
+                }
+                print(f"  - 准确率: {info['accuracy']:.3f}")
+                print(f"  - 分离度: {info['separation_degree']:.3f}")
+            else:
+                surface, model = method_func()
+                results[method_name] = {
+                    'surface': surface,
+                    'model': model,
+                    'type': 'other'
+                }
+                print(f"  - 完成")
+        except Exception as e:
+            print(f"  - 错误: {e}")
+            results[method_name] = None
+    
+    # 可视化血管分离结果
+    _visualize_vascular_separation(trunk_pts, br1_pts, br2_pts, results, tree_json)
+    
+    return results
+
+def _visualize_vascular_separation(trunk_pts, br1_pts, br2_pts, results, tree_json):
+    """
+    可视化血管分离结果
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    # 计算子图布局
+    n_methods = len([r for r in results.values() if r is not None])
+    n_cols = 2
+    n_rows = (n_methods + n_cols - 1) // n_cols
+    
+    fig = plt.figure(figsize=(12, 6 * n_rows))
+    fig.suptitle('血管数据分离方法比较', fontsize=16)
+    
+    plot_idx = 1
+    
+    for method_name, result in results.items():
+        if result is None:
+            continue
+            
+        ax = fig.add_subplot(n_rows, n_cols, plot_idx, projection='3d')
+        
+        # 绘制血管点云
+        ax.scatter(trunk_pts[:, 0], trunk_pts[:, 1], trunk_pts[:, 2], 
+                  c='red', s=20, alpha=0.7, label='主干')
+        ax.scatter(br1_pts[:, 0], br1_pts[:, 1], br1_pts[:, 2], 
+                  c='blue', s=20, alpha=0.7, label='分支1')
+        ax.scatter(br2_pts[:, 0], br2_pts[:, 1], br2_pts[:, 2], 
+                  c='green', s=20, alpha=0.7, label='分支2')
+        
+        # 绘制分离曲面
+        surface = result['surface']
+        ax.plot_surface(surface[:, :, 0], surface[:, :, 1], surface[:, :, 2], 
+                       alpha=0.3, color='yellow')
+        
+        ax.set_title(f'{method_name}')
+        ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+        ax.legend()
+        
+        # 添加统计信息
+        if result['type'] == 'svm':
+            info = result['info']
+            stats_text = f"准确率: {info['accuracy']:.3f}\n分离度: {info['separation_degree']:.3f}"
+            ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                     verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+        
+        plot_idx += 1
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    save_dir = "separation_visualization"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"vascular_separation_{os.path.basename(tree_json)}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\n血管分离结果已保存: {save_path}")
+
+# --------- Dataset ---------
